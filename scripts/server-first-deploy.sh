@@ -115,7 +115,7 @@ fi
 echo "==> 8/8 cron: occupancy snapshot every 15 min"
 mkdir -p "$APP_DIR/logs"
 CRON="*/15 * * * * cd $APP_DIR && /usr/bin/node --env-file=.env scripts/snapshot.mjs >> $APP_DIR/logs/snapshot.log 2>&1"
-( crontab -l 2>/dev/null | grep -v 'bkh-wait\|/var/www/wait' ; echo "$CRON" ) | crontab -
+( { crontab -l 2>/dev/null || true; } | { grep -v "/var/www/wait" || true; } ; echo "$CRON" ) | crontab -
 
 sleep 3
 echo
