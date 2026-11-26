@@ -17,7 +17,7 @@ APP_DIR=/var/www/wait
 KPI_ENV=/var/www/kpi/.env
 STAFF_USER="${STAFF_USER:-staff}"
 
-echo "==> 1/7 app dir + clone"
+echo "==> 1/8 app dir + clone"
 sudo mkdir -p "$APP_DIR"
 sudo chown bkhadmin:bkhadmin "$APP_DIR"
 if [ ! -d "$APP_DIR/.git" ]; then
@@ -27,7 +27,7 @@ cd "$APP_DIR"
 git fetch -q origin main && git reset -q --hard origin/main
 rm -rf /tmp/bkh-wait-tmp
 
-echo "==> 2/7 .env (HIS_* copied from bkh-kpi, secrets generated)"
+echo "==> 2/8 .env (HIS_* copied from bkh-kpi, secrets generated)"
 umask 077
 if [ ! -f .env ]; then
   rnd() { openssl rand -base64 48 | tr -dc 'A-Za-z0-9' | head -c "$1"; }
@@ -54,19 +54,22 @@ else
   echo "    .env exists - kept as is"
 fi
 
-echo "==> 3/7 PostgreSQL bkh_wait (roles, database, migrations)"
+echo "==> 3/8 npm packages (needed by the migration script)"
+npm ci --no-audit --no-fund
+
+echo "==> 4/8 PostgreSQL bkh_wait (roles, database, migrations)"
 if grep -Eq '^WAIT_DATABASE_URL=.+' .env; then
   echo "    already configured - running migrations only"
 else
   bash scripts/db-setup.sh
 fi
 
-echo "==> 4/7 build"
+echo "==> 4/8 build"
 npm ci --no-audit --no-fund
 npm run build
 node --env-file=.env scripts/db-migrate.mjs
 
-echo "==> 5/7 pm2"
+echo "==> 6/8 pm2"
 if pm2 describe bkh-wait >/dev/null 2>&1; then
   pm2 restart bkh-wait --update-env
 else
@@ -74,7 +77,7 @@ else
 fi
 pm2 save
 
-echo "==> 6/7 nginx :84 (https, same certificate as bkh-kpi :82)"
+echo "==> 7/8 nginx :84 (https, same certificate as bkh-kpi :82)"
 sudo tee /etc/nginx/sites-available/bkh-wait >/dev/null <<'NGINX'
 server {
     listen 84 ssl;
@@ -109,7 +112,7 @@ if sudo ufw status 2>/dev/null | grep -q "Status: active"; then
   sudo ufw allow 84/tcp
 fi
 
-echo "==> 7/7 cron: occupancy snapshot every 15 min"
+echo "==> 8/8 cron: occupancy snapshot every 15 min"
 mkdir -p "$APP_DIR/logs"
 CRON="*/15 * * * * cd $APP_DIR && /usr/bin/node --env-file=.env scripts/snapshot.mjs >> $APP_DIR/logs/snapshot.log 2>&1"
 ( crontab -l 2>/dev/null | grep -v 'bkh-wait\|/var/www/wait' ; echo "$CRON" ) | crontab -
