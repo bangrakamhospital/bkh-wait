@@ -12,8 +12,8 @@ import {
 } from "react";
 import { Canvas, useFrame, useThree } from "@react-three/fiber";
 import { Edges, Html, OrbitControls } from "@react-three/drei";
-import { CanvasTexture, Color, DynamicDrawUsage, MathUtils, Object3D, SRGBColorSpace, Vector3 } from "three";
-import type { Group, InstancedMesh, MeshBasicMaterial, PerspectiveCamera } from "three";
+import { Color, DynamicDrawUsage, MathUtils, Object3D, Vector3 } from "three";
+import type { Group, InstancedMesh, PerspectiveCamera } from "three";
 import type { DepartmentOccupancy, WardOccupancy } from "@/lib/beds/types";
 import { BedGrid2D } from "./BedGrid2D";
 import { bedsInUse } from "./beds";
@@ -653,66 +653,6 @@ function Nurses({ rooms, anim }: { rooms: RoomLayout[]; anim: boolean }) {
   );
 }
 
-const FLOOR_LABEL_H = 1.4;
-
-/** Flat text on the floor, drawn to a canvas texture (system fonts cover Thai; no font download). */
-function FloorLabel({ text, width, z }: { text: string; width: number; z: number }) {
-  const texture = useMemo(() => {
-    const W = 1024;
-    const H = Math.round((W * FLOOR_LABEL_H) / width);
-    const canvas = document.createElement("canvas");
-    canvas.width = W;
-    canvas.height = H;
-    const ctx = canvas.getContext("2d");
-    if (ctx) {
-      ctx.fillStyle = "#14635f";
-      ctx.beginPath();
-      ctx.roundRect(0, 0, W, H, H * 0.25);
-      ctx.fill();
-      const family = getComputedStyle(document.body).fontFamily || "sans-serif";
-      let size = H * 0.6;
-      ctx.font = `600 ${size}px ${family}`;
-      const measured = ctx.measureText(text).width;
-      if (measured > W * 0.9) {
-        size = (size * W * 0.9) / measured;
-        ctx.font = `600 ${size}px ${family}`;
-      }
-      ctx.fillStyle = "#ffffff";
-      ctx.textAlign = "center";
-      ctx.textBaseline = "middle";
-      ctx.fillText(text, W / 2, H / 2);
-    }
-    const t = new CanvasTexture(canvas);
-    t.colorSpace = SRGBColorSpace;
-    t.anisotropy = 4;
-    return t;
-  }, [text, width]);
-  useEffect(() => () => texture.dispose(), [texture]);
-  const group = useRef<Group>(null);
-  const material = useRef<MeshBasicMaterial>(null);
-  const wp = useMemo(() => new Vector3(), []);
-  useFrame(({ camera }, dt) => {
-    const g = group.current;
-    const m = material.current;
-    if (!g || !m) return;
-    g.getWorldPosition(wp);
-    const dx = camera.position.x - wp.x;
-    const dz = camera.position.z - wp.z;
-    // Flat on the floor, but turned so the text always reads upright from the camera side.
-    g.rotation.y = dampAngle(g.rotation.y, Math.atan2(dx, dz), 8, Math.min(dt, 0.1));
-    const elev = Math.atan2(camera.position.y - wp.y, Math.hypot(dx, dz));
-    m.opacity = clamp01((elev - 0.35) / 0.3);
-  });
-  return (
-    <group ref={group} position={[0, 0.3, z]}>
-      <mesh rotation={[-Math.PI / 2, 0, 0]}>
-        <planeGeometry args={[width, FLOOR_LABEL_H]} />
-        <meshBasicMaterial ref={material} map={texture} transparent toneMapped={false} />
-      </mesh>
-    </group>
-  );
-}
-
 function Zone({ zone }: { zone: ZoneLayout }) {
   return (
     <group position={[zone.cx, 0, zone.cz]}>
@@ -720,8 +660,12 @@ function Zone({ zone }: { zone: ZoneLayout }) {
         <boxGeometry args={[zone.w, 0.1, zone.d]} />
         <meshStandardMaterial color="#99d5cd" />
       </mesh>
-      {/* Department tag lies flat on the floor in the zone's front margin, so it can never overlap a room. */}
-      <FloorLabel text={`แผนก${zone.name}`} width={Math.min(zone.w - 1, 8)} z={zone.d / 2 - LABEL_STRIP / 2} />
+      {/* Department pill: screen-aligned, at the zone front edge at floor level; never rotates. */}
+      <Html position={[0, 0.2, zone.d / 2 - LABEL_STRIP / 2]} center zIndexRange={[5, 0]} pointerEvents="none">
+        <div className="translate-y-1 whitespace-nowrap rounded-md bg-brand-700 px-3 py-0.5 text-xs font-semibold text-white shadow">
+          แผนก{zone.name}
+        </div>
+      </Html>
     </group>
   );
 }
@@ -992,6 +936,7 @@ function Legend() {
       <span className="inline-flex items-center gap-1">
         <span className={`${dot} rounded-full bg-teal-700`} /> พยาบาล
       </span>
+      <span className="text-slate-500">เลื่อนเมาส์หรือคลิกที่ห้องเพื่อดูรายละเอียดหอผู้ป่วย</span>
     </div>
   );
 }
@@ -1108,9 +1053,11 @@ export default function BedScene({
             onSelect={(code) => setView((v) => ({ kind: "ward", code, n: v.n + 1 }))}
           />
         </Canvas>
-        <div className="absolute left-3 top-3 max-w-xs rounded-md bg-white/90 p-2 shadow">
-          <WardDetail ward={active} />
-        </div>
+        {active ? (
+          <div className="absolute bottom-3 left-3 max-w-xs rounded-md bg-white/90 p-2 shadow">
+            <WardDetail ward={active} />
+          </div>
+        ) : null}
         <div className="absolute right-3 top-3 flex flex-col items-end gap-2">
           {view.kind !== "overview" ? (
             <button
