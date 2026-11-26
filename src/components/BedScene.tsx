@@ -1,7 +1,6 @@
 "use client";
 
 import {
-  createContext,
   useContext,
   useCallback,
   useEffect,
@@ -23,6 +22,7 @@ import { bedsInUse } from "./beds";
 import { fmtNum, occupancyTone } from "./format";
 import { buttonGhostClass } from "./ui";
 import { WardDetail } from "./WardDetail";
+import { ANIM_KEY, LabelPortal, clamp01, detectWebGL, goalPose, hash01, now, readAnimPref, type Goal } from "./scene3d";
 
 const ZONE_COLS = 3;
 const ROOMS_PER_ZONE_ROW = 2;
@@ -42,10 +42,6 @@ const MAX_NURSES = 15;
 
 const colOffset = (c: number) => c * BED_SX + Math.floor(c / 2) * AISLE;
 const blockW = (cols: number) => (cols === 0 ? 0 : cols * BED_SX + (Math.ceil(cols / 2) - 1) * AISLE);
-const hash01 = (n: number) => {
-  const x = Math.sin(n * 127.1 + 311.7) * 43758.5453;
-  return x - Math.floor(x);
-};
 
 const COLOR_FREE = "#22c55e";
 const COLOR_OCCUPIED = "#f59e0b";
@@ -57,12 +53,13 @@ const PULSE_FULL = new Color("#ff8a80");
 const FLOOR_COLOR = {
   green: "#bbf7d0",
   amber: "#fde68a",
+  orange: "#fed7aa",
   red: "#fecaca",
   slate: "#e2e8f0",
   brand: "#d5f2ed",
 };
 
-const ANIM_KEY = "bedSceneAnimation";
+
 const IDLE_SECONDS = 8;
 const INTRO_STAGGER = 0.12;
 
@@ -102,31 +99,11 @@ type SceneLayout = {
   width: number;
   depth: number;
 };
-/** What the camera should frame: a box on the floor plus a margin (room for labels). */
-type Goal = { key: string; cx: number; cz: number; w: number; d: number; margin: number };
-
-const VIEW_ELEV = Math.atan2(0.9, 0.8);
-
-/** Camera position that fits the goal box into the current viewport aspect, with perspective slack. */
-function goalPose(g: Goal, fov: number, aspect: number): Vector3 {
-  const v = (fov * Math.PI) / 180;
-  const h = 2 * Math.atan(Math.tan(v / 2) * aspect);
-  // Fit the floor box as seen from the default viewing angle: width against the
-  // horizontal fov, foreshortened depth against the vertical fov. (A bounding
-  // sphere kept everything in view at every auto-rotate angle but opened far
-  // too zoomed out; corners may graze the edge while rotating, which is fine.)
-  const halfW = g.w / 2 + g.margin;
-  const halfD = (g.d * Math.sin(VIEW_ELEV)) / 2 + g.margin;
-  const dist = Math.max(12, Math.max(halfW / Math.tan(h / 2), halfD / Math.tan(v / 2)) * 1.2);
-  return new Vector3(g.cx, dist * Math.sin(VIEW_ELEV), g.cz + dist * Math.cos(VIEW_ELEV));
-}
 type View = { kind: "overview" | "ward" | "dept"; code: string; n: number };
 /** Mutable animation state shared by rooms, beds and the camera rig (never read during render). */
 type Shared = { lift: Record<string, number>; introAt: number };
 const SHARED: Shared = { lift: {}, introAt: 0 };
 
-const now = () => performance.now() / 1000;
-const clamp01 = (v: number) => Math.min(1, Math.max(0, v));
 const easeOutCubic = (p: number) => 1 - Math.pow(1 - p, 3);
 const easeOutBack = (p: number) => {
   const c1 = 1.70158;
@@ -136,30 +113,6 @@ const easeOutBack = (p: number) => {
 function introTime(shared: Shared): number {
   if (shared.introAt === 0) shared.introAt = now();
   return shared.introAt;
-}
-
-function detectWebGL(): boolean {
-  try {
-    const canvas = document.createElement("canvas");
-    return Boolean(canvas.getContext("webgl2") ?? canvas.getContext("webgl"));
-  } catch {
-    return false;
-  }
-}
-
-function readAnimPref(): boolean {
-  try {
-    const v = localStorage.getItem(ANIM_KEY);
-    if (v === "on") return true;
-    if (v === "off") return false;
-  } catch {
-    // storage unavailable: fall through to the OS preference
-  }
-  try {
-    return !window.matchMedia("(prefers-reduced-motion: reduce)").matches;
-  } catch {
-    return true;
-  }
 }
 
 function roomSize(n: number) {
@@ -659,14 +612,6 @@ function Nurses({ rooms, anim }: { rooms: RoomLayout[]; anim: boolean }) {
     </>
   );
 }
-
-/**
- * DOM container for drei <Html> labels. Without an explicit portal the very
- * first <Html> mounted in the scene was never attached to the page (it resolved
- * its target before the canvas wrapper existed), which hid the first
- * department pill. All labels portal into the canvas box instead.
- */
-const LabelPortal = createContext<RefObject<HTMLElement> | null>(null);
 
 function Zone({ zone }: { zone: ZoneLayout }) {
   const portal = useContext(LabelPortal) ?? undefined;

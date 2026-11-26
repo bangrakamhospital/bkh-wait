@@ -5,6 +5,7 @@ import type { Tone } from "./format";
 export const toneBadge: Record<Tone, string> = {
   green: "bg-emerald-100 text-emerald-800",
   amber: "bg-amber-100 text-amber-800",
+  orange: "bg-orange-100 text-orange-800",
   red: "bg-red-100 text-red-800",
   slate: "bg-slate-200 text-slate-700",
   brand: "bg-brand-100 text-brand-800",
@@ -13,6 +14,7 @@ export const toneBadge: Record<Tone, string> = {
 export const toneBar: Record<Tone, string> = {
   green: "bg-emerald-500",
   amber: "bg-amber-500",
+  orange: "bg-orange-500",
   red: "bg-red-500",
   slate: "bg-slate-400",
   brand: "bg-brand-500",
@@ -21,6 +23,7 @@ export const toneBar: Record<Tone, string> = {
 export const toneText: Record<Tone, string> = {
   green: "text-emerald-700",
   amber: "text-amber-700",
+  orange: "text-orange-700",
   red: "text-red-700",
   slate: "text-slate-600",
   brand: "text-brand-700",
