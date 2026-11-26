@@ -25,7 +25,7 @@ const ZONE_COLS = 2;
 const ROOMS_PER_ZONE_ROW = 2;
 const GAP = 3;
 const ZONE_PAD = 1.5;
-const ZONE_GAP = 4;
+const ZONE_GAP = 7;
 /** Strip at the front edge of every zone reserved for the department label. */
 const LABEL_STRIP = 2.2;
 /** One fixed bed footprint everywhere; rooms grow with their bed grid. */
@@ -110,7 +110,7 @@ function goalPose(g: Goal, fov: number, aspect: number): Vector3 {
   const h = 2 * Math.atan(Math.tan(v / 2) * aspect);
   // Bounding sphere: stays fully in view from every auto-rotate angle.
   const radius = Math.hypot(g.w, g.d) / 2 + g.margin;
-  const dist = Math.max(14, (radius / Math.sin(Math.min(v, h) / 2)) * 1.05);
+  const dist = Math.max(14, (radius / Math.sin(Math.min(v, h) / 2)) * 1.15);
   return new Vector3(g.cx, dist * Math.sin(VIEW_ELEV), g.cz + dist * Math.cos(VIEW_ELEV));
 }
 type View = { kind: "overview" | "ward" | "dept"; code: string; n: number };
@@ -661,7 +661,7 @@ function Zone({ zone }: { zone: ZoneLayout }) {
         <meshStandardMaterial color="#99d5cd" />
       </mesh>
       {/* Department pill: screen-aligned, at the zone front edge at floor level; never rotates. */}
-      <Html position={[0, 0.2, zone.d / 2 - LABEL_STRIP / 2]} center zIndexRange={[5, 0]} pointerEvents="none">
+      <Html position={[0, 0.2, zone.d / 2 - 0.8]} center zIndexRange={[5, 0]} pointerEvents="none">
         <div className="translate-y-1 whitespace-nowrap rounded-md bg-brand-700 px-3 py-0.5 text-xs font-semibold text-white shadow">
           แผนก{zone.name}
         </div>
@@ -739,7 +739,7 @@ function Room({
         </mesh>
         {showLabel ? (
           <Html
-            position={[0, 2.2 + (room.col % 2) * 1.8, -d / 2 + 0.6]}
+            position={[0, 1.4 + (room.col % 2) * 1.5, -d / 2 + 0.6]}
             center
             zIndexRange={[20, 0]}
             pointerEvents="none"
@@ -1007,7 +1007,7 @@ export default function BedScene({
       const z = layout.zones.find((x) => x.code === view.code);
       if (z) return fitGoal(key, z.cx, z.cz, z.w, z.d, 4);
     }
-    return fitGoal(key, 0, 0, layout.width + 6, layout.depth + 6, 5);
+    return fitGoal(key, 0, layout.depth * 0.05, layout.width + 6, layout.depth + 6, 6);
   }, [view, layout]);
 
   // Hide ward labels outside the focus when zoomed into a ward or department.
