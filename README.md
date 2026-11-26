@@ -17,9 +17,15 @@ patients wait from registration to the doctor (การรอคอยการ
 - API contract: [`docs/api.md`](docs/api.md); shared types: `src/lib/beds/types.ts`,
   `src/lib/opd/types.ts`
 
-Only aggregate counts leave the server; no patient identifiers are stored
-or sent (refer-back requests carry a case reference of the sending hospital,
-13-digit IDs are rejected).
+Only aggregate counts leave the server (refer-back requests carry a case
+reference of the sending hospital, 13-digit IDs are rejected). The ONE
+patient identifier kept is the **HN per occupied bed** (`wait.bed_occupant`,
+db/006) for the 3D bed scene: staff tap a bed and see the HN. It is
+readable only by logged-in `staff` through `GET /api/beds/occupants`; the
+app's database role cannot SELECT the table and goes through the
+`SECURITY DEFINER` function `wait.bed_occupants_for_ward`, which writes an
+`audit_log` row (`view_hn`) for every view. Never in the public board or
+the central API. No AN, names or CID are stored anywhere.
 
 ## Architecture
 
@@ -30,6 +36,9 @@ HOSxP (MySQL, SELECT-only account)
 PostgreSQL bkh_wait.wait
    his_ward, his_spclty           ward / spclty names, HOSxP bed capacity
    ward_state, ward_spclty_state  current census (last successful sync)
+   bed_slot                       physical beds + occupied flag (public)
+   bed_occupant                   RESTRICTED: HN per occupied bed; app reads it only via
+                                  bed_occupants_for_ward() (audited), sync role write-only
    occupancy_snapshot             history, one row per ward per sync
    daily_census                   one row per (date, ward), finalized after midnight
    sync_run                       one row per run (job beds | opd, ok / error code)
@@ -44,6 +53,7 @@ PostgreSQL bkh_wait.wait
 Next.js web app (pm2, 127.0.0.1:3084, nginx :84)
    /            board (asOf = last sync, "stale" warning after 30 min)
    /api/board, /api/trend, /api/refer, /api/departments
+   /api/beds/occupants            HN per bed, staff session only, audited
    /opd         OPD board (stale after 15 min during 06:15-20:30)
    /api/opd/board
    /api/v1/census, /api/v1/beds/current, /api/v1/opd/current, /api/v1/opd/daily
@@ -59,6 +69,7 @@ Next.js web app (pm2, 127.0.0.1:3084, nginx :84)
 | patients | `ipt.dchdate IS NULL AND ipt.regdate >= CURDATE() - INTERVAL 180 DAY` (`ipt.ward` = current ward) |
 | beds in use (เตียงคนนอน) | distinct `iptadm.bedno` of those patients (bed of their current ward) |
 | free (เตียงว่าง) | `max(beds - beds in use, 0)` |
+| bed slots | every `bedno ⨝ roomno` of the ward, order `roomno`, `bed_order`, `bedno`; occupied = a current patient of the ward has it in `iptadm.bedno` |
 | department | `ward_config.department_code` → `wait.department`; fallback: ward's dominant `ipt.spclty` |
 | admitted / discharged (day D) | `ipt.regdate = D` / `ipt.dchdate = D` |
 | patient days (day D) | midnight census: `regdate <= D AND (dchdate IS NULL OR dchdate > D)`, same 180-day cutoff |
@@ -124,20 +135,29 @@ Path `/var/www/wait`, deploy only `main`. pm2 process `bkh-wait` on
   before the switch leaves the old app and its cron working; fix and
   re-run. Existing history is kept.
 
-Existing install from before the OPD board: `bash scripts/server-upgrade-opd.sh`
-once (git reset to origin/main, npm ci, preflight dry run, migration 005,
-build, pm2 restart, first OPD sync with 30 days backfill, adds the OPD cron
-line if missing). No sudo; safe to re-run.
-
-Later deploys:
+Every later deploy (including the OPD board and the bed-HN upgrade):
 
 ```bash
-cd /var/www/wait
-git fetch origin main && git reset --hard origin/main
-npm ci --no-audit --no-fund && npm run build
-npm run db:migrate                  # no-op when up to date
-pm2 restart bkh-wait --update-env
+cd /var/www/wait && git fetch origin main && git reset --hard origin/main
+bash scripts/server-upgrade.sh
 ```
+
+`scripts/server-upgrade.sh` (as bkhadmin, no sudo, safe to re-run): git
+reset to origin/main, npm ci, preflight dry run of both workers, pending
+migrations (005 OPD, 006 bed slots / occupants, ...), one bed sync,
+build, pm2 restart, first OPD sync with 30 days backfill when OPD is new,
+adds the bed / OPD cron lines if missing, then checks `/api/board` has
+`bedSlots` and `/api/beds/occupants` answers 401 without login.
+`scripts/server-upgrade-opd.sh` is now a wrapper around it.
+
+Upgrade notes for 006 (bed HN):
+- Additive: new tables `bed_slot`, `bed_occupant`, function
+  `bed_occupants_for_ward`. The app needs 006 before it starts (the board
+  reads `bed_slot`) — the script migrates before the restart.
+- From now on the PostgreSQL database (and its backups) holds the HN of
+  current inpatients. Keep backups as protected as HOSxP's.
+- Audit of HN views:
+  `SELECT at, actor, entity_id AS ward, detail->>'rows' AS rows FROM wait.audit_log WHERE action = 'view_hn' ORDER BY at DESC LIMIT 50;`
 
 ### Env files (both mode 0600, never committed)
 

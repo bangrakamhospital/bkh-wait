@@ -39,6 +39,35 @@ export type WardOccupancy = {
   departmentCode: string | null;
   /** Occupied beds in this ward split by clinical department (HOSxP ipt.spclty). */
   byDepartment: DepartmentCount[];
+  /**
+   * Physical beds of the ward in HOSxP order (bedno/roomno), occupied flag only —
+   * no patient data. Lets the 3D scene draw the real beds and identify a click.
+   */
+  bedSlots: BedSlot[];
+};
+
+/** One physical bed (public, non-identifying). */
+export type BedSlot = {
+  bedno: string;
+  /** HOSxP bed name/number shown to staff, e.g. "12" or "ห้องพิเศษ 3". */
+  bedName: string;
+  roomName: string | null;
+  occupied: boolean;
+};
+
+/**
+ * Patient on a bed — RESTRICTED. Only returned by the authenticated staff
+ * endpoint (GET /api/beds/occupants?ward=), every call audit-logged; never in
+ * the public board, snapshots, or the central API.
+ */
+export type BedOccupant = {
+  bedno: string;
+  bedName: string;
+  hn: string;
+  /** YYYY-MM-DD */
+  admitDate: string;
+  lengthOfStayDays: number;
+  spcltyName: string | null;
 };
 
 /** Occupied beds of one clinical department (HOSxP spclty). */

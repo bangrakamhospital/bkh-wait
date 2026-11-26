@@ -1,9 +1,11 @@
 # bkh-wait API
 
 All endpoints live under `/api`, return JSON and use the types in
-`src/lib/beds/types.ts`. Only aggregate counts, ward configuration and
-refer-back metadata cross the API — never patient names, CID, HN, AN or bed
-numbers.
+`src/lib/beds/types.ts`. Only aggregate counts, ward configuration,
+refer-back metadata and the public bed layout (bed numbers + occupied flag)
+cross the API — never patient names, CID or AN. The ONE exception is the
+HN per bed of `GET /api/beds/occupants`: logged-in `staff` only, every
+view written to the audit log (see "Bed occupants").
 
 ## Conventions
 
@@ -15,13 +17,13 @@ numbers.
   | 400  | `VALIDATION`              | bad body / query; `error` names the field                        |
   | 401  | `UNAUTHENTICATED`         | not logged in / session expired, or wrong username/password      |
   | 403  | `FORBIDDEN`               | role not allowed, or cross-site request blocked                  |
-  | 404  | `NOT_FOUND`               | refer request id does not exist                                  |
+  | 404  | `NOT_FOUND`               | refer request id / ward does not exist                           |
   | 409  | `INVALID_TRANSITION`      | status change not allowed from the current status                |
   | 415  | `UNSUPPORTED_MEDIA_TYPE`  | write request without `Content-Type: application/json`           |
   | 429  | `TOO_MANY_ATTEMPTS`       | too many failed logins; `Retry-After` header (seconds)           |
   | 503  | `AUTH_NOT_CONFIGURED`     | `WAIT_SESSION_SECRET` not set on the server — login disabled     |
   | 503  | `WAIT_DB_NOT_CONFIGURED`  | PostgreSQL (`WAIT_DATABASE_URL`) not set — refer/config features off |
-  | 429  | `RATE_LIMITED`            | central API: too many calls for this key / failed keys from this IP; `Retry-After` |
+  | 429  | `RATE_LIMITED`            | central API: too many calls for this key / failed keys from this IP; bed occupants: too many calls for this user; `Retry-After` |
   | 503  | `SYNC_NOT_READY`          | no successful HOSxP sync yet (board has no data)                 |
   | 503  | `API_NOT_CONFIGURED`      | central API: `WAIT_API_KEYS` not set                             |
   | 500  | `INTERNAL`                | anything else                                                    |
@@ -93,6 +95,18 @@ Per ward (`WardOccupancy`):
 | `referWaiting`    | refer-back requests with status `waiting` for this ward (0 without PostgreSQL)                   |
 | `departmentCode`  | the group in `departments[]` this ward belongs to (see below)                                    |
 | `byDepartment`    | current patients of the ward split by HOSxP `ipt.spclty` (most first)                            |
+| `bedSlots`        | the physical beds (`BedSlot[]`), see below — public, no patient data                             |
+
+`bedSlots[]` (`BedSlot`): every HOSxP bed of the ward (`bedno` ⨝ `roomno`
+on `roomno.ward`), ordered by `roomno`, `bed_order` (empty last), `bedno`.
+`bedno` (HOSxP bed code, e.g. `"Y03"`), `bedName` (`bedno.bedname`, else
+`bedno` — HOSxP has no bed names today), `roomName` (`roomno.name`) and
+`occupied`: a current inpatient of this ward has this bed in `iptadm.bedno`
+(the same set as beds in use, so `count(occupied) = occupied - occupiedNoBed`).
+Patients without a bed of their own are not placed on any slot.
+`bedSlots.length` is the HOSxP bed count and can differ from `beds` when
+`ward_config.bed_capacity` overrides it. Written by the bed sync
+(`wait.bed_slot`), same `asOf`.
 
 `departments[]` (`DepartmentOccupancy`) — the bed departments (แผนก):
 - ward with `ward_config.department_code` → that department (`wait.department`);
@@ -117,6 +131,53 @@ request, including those without a ward.
 `beds` = capacity at that time, `bedsInUse` = beds in use (เตียงคนนอน) at
 that time, `null` for points taken before migration 002. Without PostgreSQL: `configured: false`,
 `points: []` (not an error). `Cache-Control: public, max-age=60`.
+
+## Bed occupants (staff only, HN)
+
+### `GET /api/beds/occupants?ward=01` (role `staff`)
+Who lies in which bed of one ward — for the 3D bed scene: a staff member
+taps a bed and sees the patient's HN.
+
+200
+```json
+{
+  "wardCode": "01",
+  "asOf": "2026-11-26T03:15:04.120Z",
+  "occupants": [
+    { "bedno": "040", "bedName": "040", "hn": "<HN>", "admitDate": "2026-11-20",
+      "lengthOfStayDays": 6, "spcltyName": "อายุรกรรม" }
+  ]
+}
+```
+`occupants` (`BedOccupant[]`) in `bedSlots` order; match them to the slots
+by `bedno`. `lengthOfStayDays` = today (Asia/Bangkok) − `admitDate`.
+`asOf` = the same bed sync as the board.
+
+| status | when |
+| ------ | ---- |
+| 401 `UNAUTHENTICATED` | no / expired session |
+| 403 `FORBIDDEN` | role `partner`, or a cross-site request (`Sec-Fetch-Site` other than `same-origin`/`none`, or a foreign `Origin`) |
+| 400 `VALIDATION` | `ward` missing or not 1–4 letters/digits |
+| 404 `NOT_FOUND` | ward not on the board (unknown, inactive, hidden or virtual) |
+| 429 `RATE_LIMITED` | more than 30 calls per minute for this user; `Retry-After` |
+| 503 | `SYNC_NOT_READY` / `WAIT_DB_NOT_CONFIGURED` |
+
+Privacy rules:
+- **HN is visible only to logged-in `staff`.** Never in `/api/board`, the
+  trend, snapshots, the daily census or the central API (`/api/v1/*`).
+- **Every view is audited.** The web app's database role cannot read
+  `wait.bed_occupant`; it can only call `wait.bed_occupants_for_ward(ward,
+  actor)` (db/006, `SECURITY DEFINER`), which returns the rows and appends
+  one `wait.audit_log` row (`actor` = username, `action` = `view_hn`,
+  `entity` = `ward`, `entity_id` = ward code, `detail.rows` = rows
+  returned) in the same statement. The audit row never contains an HN.
+  Review: `SELECT at, actor, entity_id, detail FROM wait.audit_log WHERE action = 'view_hn' ORDER BY at DESC;`
+- `Cache-Control: private, no-store`, `Vary: Cookie`; never cached on the
+  server (no memo). Fetch it when a bed is tapped, keep it in component
+  state only (no localStorage / URL), drop it when the scene closes.
+- Only the HN is stored (no AN, name or CID); the table is replaced on every
+  bed sync, so discharged patients disappear within 15 minutes. Database
+  backups now contain current inpatient HNs — protect them like HOSxP backups.
 
 ## Departments (bed grouping)
 

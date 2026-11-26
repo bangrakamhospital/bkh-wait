@@ -80,3 +80,24 @@ export function recordLoginSuccess(ip: string, username: string) {
   buckets.delete(k.user);
   buckets.delete(k.name);
 }
+
+/**
+ * Fixed-window request limiter for authenticated reads (per process, in
+ * memory, separate from the login buckets). Counts one hit for `key`;
+ * returns seconds to wait when over `max` per `windowMs`, else 0.
+ */
+const r = globalThis as unknown as { __waitRequestLimiter?: Map<string, Bucket> };
+const requestBuckets: Map<string, Bucket> = (r.__waitRequestLimiter ??= new Map());
+
+export function hitRequestLimit(key: string, max: number, windowMs: number, now = Date.now()): number {
+  if (requestBuckets.size > MAX_KEYS) {
+    for (const [k, b] of requestBuckets) if (b.resetAt <= now) requestBuckets.delete(k);
+  }
+  let b = requestBuckets.get(key);
+  if (!b || b.resetAt <= now) {
+    b = { count: 0, resetAt: now + windowMs };
+    requestBuckets.set(key, b);
+  }
+  b.count += 1;
+  return b.count > max ? Math.ceil((b.resetAt - now) / 1000) : 0;
+}
