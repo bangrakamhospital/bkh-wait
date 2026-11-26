@@ -41,3 +41,17 @@ body {
   color: var(--foreground);
   font-family: var(--font-sarabun), sans-serif;
 }
+
+@keyframes bed-float {
+  0%,
+  100% {
+    transform: translateY(0);
+  }
+  50% {
+    transform: translateY(-6px);
+  }
+}
+
+.bed-float {
+  animation: bed-float 2.4s ease-in-out infinite;
+}
