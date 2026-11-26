@@ -24,7 +24,7 @@ import { fmtNum, occupancyTone } from "./format";
 import { buttonGhostClass } from "./ui";
 import { WardDetail } from "./WardDetail";
 
-const ZONE_COLS = 2;
+const ZONE_COLS = 3;
 const ROOMS_PER_ZONE_ROW = 2;
 const GAP = 3;
 const ZONE_PAD = 1.5;
@@ -111,9 +111,13 @@ const VIEW_ELEV = Math.atan2(0.9, 0.8);
 function goalPose(g: Goal, fov: number, aspect: number): Vector3 {
   const v = (fov * Math.PI) / 180;
   const h = 2 * Math.atan(Math.tan(v / 2) * aspect);
-  // Bounding sphere: stays fully in view from every auto-rotate angle.
-  const radius = Math.hypot(g.w, g.d) / 2 + g.margin;
-  const dist = Math.max(14, (radius / Math.sin(Math.min(v, h) / 2)) * 1.15);
+  // Fit the floor box as seen from the default viewing angle: width against the
+  // horizontal fov, foreshortened depth against the vertical fov. (A bounding
+  // sphere kept everything in view at every auto-rotate angle but opened far
+  // too zoomed out; corners may graze the edge while rotating, which is fine.)
+  const halfW = g.w / 2 + g.margin;
+  const halfD = (g.d * Math.sin(VIEW_ELEV)) / 2 + g.margin;
+  const dist = Math.max(12, Math.max(halfW / Math.tan(h / 2), halfD / Math.tan(v / 2)) * 1.2);
   return new Vector3(g.cx, dist * Math.sin(VIEW_ELEV), g.cz + dist * Math.cos(VIEW_ELEV));
 }
 type View = { kind: "overview" | "ward" | "dept"; code: string; n: number };
@@ -1021,7 +1025,7 @@ export default function BedScene({
       const z = layout.zones.find((x) => x.code === view.code);
       if (z) return fitGoal(key, z.cx, z.cz, z.w, z.d, 4);
     }
-    return fitGoal(key, 0, layout.depth * 0.05, layout.width + 6, layout.depth + 6, 6);
+    return fitGoal(key, 0, layout.depth * 0.04, layout.width, layout.depth, 2.5);
   }, [view, layout]);
 
   // Hide ward labels outside the focus when zoomed into a ward or department.
