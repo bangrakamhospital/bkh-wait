@@ -10,7 +10,10 @@
 #      on psql's STDIN (never on a command line: not visible in ps / history)
 #   3. appends WAIT_DATABASE_URL (app account) and WAIT_MIGRATE_DATABASE_URL
 #      (owner account) to .env (mode 0600) — refuses if they already exist
-#   4. runs the migrations (scripts/db-migrate.mjs)
+#   4. creates the sync worker role bkh_wait_sync and writes
+#      WAIT_SYNC_DATABASE_URL to .env.sync (scripts/db-sync-role.sh)
+#   5. runs the migrations (scripts/db-migrate.mjs; db/003 grants the
+#      sync tables to bkh_wait_sync / bkh_wait_app)
 # Passwords are never printed. Afterwards: pm2 restart bkh-wait --update-env
 set -euo pipefail
 
@@ -18,7 +21,7 @@ APP_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 ENV_FILE="$APP_DIR/.env"
 cd "$APP_DIR"
 
-[ -f "$ENV_FILE" ] || { echo "Missing $ENV_FILE (copy .env.example and fill in HIS_* first)"; exit 1; }
+[ -f "$ENV_FILE" ] || { echo "Missing $ENV_FILE (copy .env.example first)"; exit 1; }
 if grep -Eq '^WAIT_(MIGRATE_)?DATABASE_URL=.+' "$ENV_FILE"; then
   echo "WAIT_DATABASE_URL is already set in $ENV_FILE - nothing to do."
   echo "(To start over: drop the database/roles by hand and remove the WAIT_*DATABASE_URL lines.)"
@@ -54,6 +57,9 @@ sed -i -E '/^WAIT_(MIGRATE_)?DATABASE_URL=$/d' "$ENV_FILE"
 } >> "$ENV_FILE"
 chmod 600 "$ENV_FILE"
 unset OWNER_PW APP_PW
+
+echo "==> sync worker role (bkh_wait_sync -> .env.sync)"
+bash scripts/db-sync-role.sh
 
 echo "==> migrations"
 node --env-file="$ENV_FILE" scripts/db-migrate.mjs

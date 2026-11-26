@@ -24,7 +24,7 @@ export default async function DashboardPage() {
     <>
       <div className="flex flex-wrap items-center justify-between gap-2">
         <h1 className="text-base font-semibold">สถานะเตียงรายแผนกและหอผู้ป่วย</h1>
-        <AutoRefresh asOf={board.asOf} />
+        <AutoRefresh asOf={board.asOf} stale={board.stale} />
       </div>
       <DashboardView board={board} />
     </>

@@ -21,7 +21,9 @@ numbers.
   | 429  | `TOO_MANY_ATTEMPTS`       | too many failed logins; `Retry-After` header (seconds)           |
   | 503  | `AUTH_NOT_CONFIGURED`     | `WAIT_SESSION_SECRET` not set on the server — login disabled     |
   | 503  | `WAIT_DB_NOT_CONFIGURED`  | PostgreSQL (`WAIT_DATABASE_URL`) not set — refer/config features off |
-  | 503  | `HIS_UNAVAILABLE`         | HOSxP could not be read                                          |
+  | 429  | `RATE_LIMITED`            | central API: too many calls for this key / failed keys from this IP; `Retry-After` |
+  | 503  | `SYNC_NOT_READY`          | no successful HOSxP sync yet (board has no data)                 |
+  | 503  | `API_NOT_CONFIGURED`      | central API: `WAIT_API_KEYS` not set                             |
   | 500  | `INTERNAL`                | anything else                                                    |
 
 - **Writes** (`POST`, `PUT`, `PATCH`) must send
@@ -60,11 +62,18 @@ No body. 200 `{ "ok": true }`, clears the cookie. Always succeeds.
 ### `GET /api/board`
 200 `BedBoard`. Public (aggregate counts only).
 `Cache-Control: public, max-age=15, stale-while-revalidate=45`; the server
-also memoises the board for 10 s. 503 `HIS_UNAVAILABLE` when HOSxP is down.
+also memoises the board for 10 s.
+
+Source: PostgreSQL only — the last successful run of the HOSxP sync worker
+(`scripts/sync-hosxp.mjs`, every 15 min). The web app never queries HOSxP.
+- `asOf`: finish time of that sync run (ISO, UTC).
+- `stale`: `true` when `asOf` is older than 30 minutes (sync not running);
+  the UI shows a warning next to the timestamp.
+- 503 `SYNC_NOT_READY` before the first successful sync,
+  503 `WAIT_DB_NOT_CONFIGURED` without PostgreSQL.
 
 Which wards: HOSxP `ward.ward_active = 'Y'`, minus **virtual** wards
-(`ward_config.is_virtual`; ward 17 Home Ward by default, also when
-PostgreSQL is not configured) and wards hidden with `visible = false`.
+(`ward_config.is_virtual`; ward 17 Home Ward by default) and wards hidden with `visible = false`.
 Virtual wards appear nowhere: not in `wards`, `departments`, `bySpclty` or
 `totals`. Order: `ward_config.sort_order`, then ward code.
 
@@ -88,7 +97,7 @@ Per ward (`WardOccupancy`):
 `departments[]` (`DepartmentOccupancy`) — the bed departments (แผนก):
 - ward with `ward_config.department_code` → that department (`wait.department`);
 - ward with a `ward_config` row but no department → `"_none"` / `"ไม่ระบุแผนก"`;
-- ward without a `ward_config` row (or no PostgreSQL) → its most frequent
+- ward without a `ward_config` row → its most frequent
   `spclty` over the last year, code `"sp-<spclty>"` (e.g. `"sp-01"` อายุรกรรม).
 
 Sums over its wards (`beds`, `occupied`, `occupiedNoBed`, `available`,
@@ -104,7 +113,7 @@ request, including those without a ward.
 `hours`: integer 1–168 (default 24). `ward` optional.
 200 `{ "hours": number, "configured": boolean, "points": OccupancyPoint[] }`
 — ordered by `at`, then `wardCode`; one point per ward every 15 minutes
-(virtual / hidden wards excluded). `occupied` = patients in the ward,
+(virtual / hidden wards excluded), written by the sync worker. `occupied` = patients in the ward,
 `beds` = capacity at that time, `bedsInUse` = beds in use (เตียงคนนอน) at
 that time, `null` for points taken before migration 002. Without PostgreSQL: `configured: false`,
 `points: []` (not an error). `Cache-Control: public, max-age=60`.
@@ -127,7 +136,7 @@ that time, `null` for points taken before migration 002. Without PostgreSQL: `co
   ]
 }
 ```
-`wards` lists every active HOSxP ward (virtual ones included, so staff can
+`wards` lists every active HOSxP ward as of the last sync (virtual ones included, so staff can
 see / change the flag). 503 `WAIT_DB_NOT_CONFIGURED` without PostgreSQL.
 
 ### `PUT /api/departments` (role `staff`)
@@ -201,12 +210,133 @@ Body `{ "status": ReferStatus, "wardCode"?: string | null }`
 
 200 `{ "request": ReferBackRequest }`; 404 `NOT_FOUND`; 409 `INVALID_TRANSITION`.
 
-## Internal
+## API สำหรับส่วนกลาง
 
-### `POST /api/snapshot`
-Header `Authorization: Bearer <WAIT_SNAPSHOT_TOKEN>` (403 otherwise, or
-when the token is not configured). Writes one `wait.occupancy_snapshot` row
-per non-virtual active ward (timestamp truncated to the minute; repeats in
-the same minute are ignored). Triggered by cron through `scripts/snapshot.mjs`
-every 15 minutes; not for the UI.
-200 `{ "takenAt": string, "wards": number }`.
+API แบบเครื่องต่อเครื่องสำหรับส่งข้อมูลเตียงให้ส่วนกลาง / เขตสุขภาพ ข้อมูลทั้งหมดอ่านจาก
+PostgreSQL ของเราเอง (`bkh_wait`) ซึ่ง sync worker คัดลอกจาก HOSxP ทุก 15 นาที —
+API นี้ **ไม่เชื่อมต่อ HOSxP** และส่งเฉพาะค่าสรุประดับหอผู้ป่วย / แผนก
+(hospcode 11252) ไม่มีข้อมูลระบุตัวผู้ป่วย (ชื่อ, HN, AN, CID, เลขเตียง)
+
+### การยืนยันตัวตน
+
+- ทุกคำขอต้องส่ง header `Authorization: Bearer <key>`
+- ผู้ดูแลระบบออก key ด้วย `node scripts/make-api-key.mjs <ชื่อผู้ใช้ API>` สคริปต์จะพิมพ์
+  key (แสดงครั้งเดียว ส่งให้ส่วนกลางผ่านช่องทางที่ปลอดภัย) และรายการ `ชื่อ:sha256hex`
+  ให้นำไปต่อท้าย `WAIT_API_KEYS` ใน `.env` ของเซิร์ฟเวอร์ (คั่นด้วย `,`) แล้ว
+  `pm2 restart bkh-wait --update-env` — เซิร์ฟเวอร์เก็บเฉพาะค่า hash ยกเลิก key ได้โดยลบรายการนั้นออก
+- เปรียบเทียบ key แบบ constant-time
+- จำกัด 60 ครั้ง/นาที ต่อ key (เกินได้ 429 `RATE_LIMITED` พร้อม `Retry-After`)
+  และ key ผิด 20 ครั้ง/5 นาที ต่อ IP จะถูกปฏิเสธชั่วคราว
+- ทุกคำขอที่ยืนยันตัวตนผ่านจะถูกบันทึกใน `wait.audit_log`
+  (`actor = api:<ชื่อ key>`, endpoint, ช่วงวันที่, HTTP status)
+- CORS ปิดเป็นค่าเริ่มต้น (ไม่ส่ง header `Access-Control-*`) ถ้าจำเป็นต้องเรียกจาก
+  เบราว์เซอร์ ให้ใส่ origin ที่อนุญาตใน `WAIT_API_CORS_ORIGINS`
+- ไม่ได้ตั้ง `WAIT_API_KEYS` → 503 `API_NOT_CONFIGURED`; key ผิด/ไม่มี → 401 `UNAUTHENTICATED`
+- ทุกคำตอบเป็น `Cache-Control: private, no-store` เวลาเป็น ISO 8601 (UTC) ส่วนวันที่
+  (`date`, `from`, `to`) เป็นวันตามเวลาประเทศไทย (Asia/Bangkok)
+
+### `GET /api/v1/beds/current`
+
+สถานะเตียงปัจจุบัน (ผล sync ล่าสุด) — หอผู้ป่วยเดียวกับหน้า board
+(ไม่รวมหอเสมือน เช่น 17 Home Ward และหอที่ซ่อน)
+
+```bash
+curl -s https://10.10.10.159:84/api/v1/beds/current \
+  -H "Authorization: Bearer $BKH_WAIT_API_KEY"
+```
+
+```json
+{
+  "hospcode": "11252",
+  "asOf": "2026-11-26T03:00:12.345Z",
+  "stale": false,
+  "totals": { "beds": 120, "bedsInUse": 50, "available": 70, "occupancyPct": 41.7, "patients": 52 },
+  "departments": [
+    {
+      "departmentCode": "med", "departmentName": "อายุรกรรม", "wardCodes": ["01", "02"],
+      "beds": 80, "bedsInUse": 40, "available": 40, "occupancyPct": 50, "patients": 41
+    }
+  ],
+  "wards": [
+    {
+      "wardCode": "01", "wardName": "หอผู้ป่วยตัวอย่าง", "departmentCode": "med",
+      "beds": 40, "bedsInUse": 20, "available": 20, "occupancyPct": 50, "patients": 21,
+      "admittedToday": 3, "dischargedToday": 2
+    }
+  ]
+}
+```
+(ตัวเลขในตัวอย่างเป็นค่าสมมติ)
+
+| field | ความหมาย |
+| --- | --- |
+| `asOf` | เวลาที่ sync จาก HOSxP สำเร็จครั้งล่าสุด |
+| `stale` | `true` เมื่อ `asOf` เก่ากว่า 30 นาที (sync ไม่ทำงาน — ข้อมูลอาจไม่เป็นปัจจุบัน) |
+| `beds` | เตียงทั้งหมด (ค่าที่ รพ. กำหนด หรือจำนวนเตียงจริงใน HOSxP) |
+| `bedsInUse` | เตียงที่มีผู้ป่วยนอน |
+| `available` | เตียงว่าง = `max(beds - bedsInUse, 0)` |
+| `occupancyPct` | `(beds - available) / beds * 100` ทศนิยม 1 ตำแหน่ง |
+| `patients` | ผู้ป่วยในที่ยังไม่จำหน่าย (อาจมากกว่า `bedsInUse` เมื่อมีผู้ป่วยยังไม่ได้เตียง) |
+| `admittedToday` / `dischargedToday` | รับใหม่ / จำหน่าย วันนี้ |
+
+ข้อผิดพลาด: 503 `SYNC_NOT_READY` (ยังไม่เคย sync สำเร็จ), 503 `WAIT_DB_NOT_CONFIGURED`
+
+### `GET /api/v1/census?from=YYYY-MM-DD&to=YYYY-MM-DD`
+
+สถิติเตียงรายวัน รายหอผู้ป่วย (`wait.daily_census`) ช่วงวันที่รวมไม่เกิน **92 วัน**
+(`from` ≤ `to`, นับรวมทั้งสองวัน) ผิดรูปแบบ → 400 `VALIDATION`
+
+```bash
+curl -s "https://10.10.10.159:84/api/v1/census?from=2026-11-01&to=2026-11-30" \
+  -H "Authorization: Bearer $BKH_WAIT_API_KEY"
+```
+
+```json
+{
+  "hospcode": "11252",
+  "from": "2026-11-01",
+  "to": "2026-11-30",
+  "generatedAt": "2026-11-26T03:05:00.000Z",
+  "lastSyncAt": "2026-11-26T03:00:12.345Z",
+  "stale": false,
+  "days": [
+    {
+      "date": "2026-11-25", "finalized": true, "wards": 7,
+      "beds": 120, "bedsInUse": 48, "available": 72, "occupancyPct": 40,
+      "admitted": 20, "discharged": 22, "patientDays": 47
+    }
+  ],
+  "rows": [
+    {
+      "date": "2026-11-25",
+      "wardCode": "01", "wardName": "หอผู้ป่วยตัวอย่าง",
+      "departmentCode": "med", "departmentName": "อายุรกรรม",
+      "beds": 40, "bedsInUse": 19, "available": 21, "occupancyPct": 47.5,
+      "peakBedsInUse": 23,
+      "admitted": 8, "discharged": 9, "patientDays": 18,
+      "finalized": true,
+      "updatedAt": "2026-11-25T17:00:09.000Z"
+    }
+  ]
+}
+```
+(ตัวเลขในตัวอย่างเป็นค่าสมมติ)
+
+`rows` = หนึ่งแถวต่อ (วัน, หอผู้ป่วย) เรียงตามวันที่และลำดับหอ (`DailyCensus` ใน
+`src/lib/beds/types.ts`); `days` = ผลรวมทั้งโรงพยาบาลของแต่ละวัน
+(`finalized` = ทุกหอของวันนั้นปิดยอดแล้ว) วันที่ไม่มีข้อมูล (sync ยังไม่ทำงานในวันนั้น)
+จะไม่มีแถว
+
+| field | ความหมาย |
+| --- | --- |
+| `beds` | เตียงทั้งหมด ณ sync ล่าสุดของวันนั้น |
+| `bedsInUse` | เตียงที่มีผู้ป่วยนอน ณ sync ล่าสุดของวันนั้น (วันที่ปิดแล้ว = sync สุดท้ายก่อนเที่ยงคืน) |
+| `available`, `occupancyPct` | คำนวณจาก `beds` และ `bedsInUse` เช่นเดียวกับ beds/current |
+| `peakBedsInUse` | เตียงที่มีผู้ป่วยนอนสูงสุดในบรรดาการ sync ของวันนั้น |
+| `admitted` | รับใหม่ในวันนั้น (`ipt.regdate`) |
+| `discharged` | จำหน่ายในวันนั้น (`ipt.dchdate`) |
+| `patientDays` | วันนอน = จำนวนผู้ป่วยที่ยังนอนอยู่ ณ เที่ยงคืนสิ้นวัน (midnight census) |
+| `finalized` | `false` = วันนี้ (ตัวเลขยังเปลี่ยนได้, `patientDays` = ผู้ป่วยที่นอนอยู่ขณะนี้) · `true` = ปิดยอดแล้วโดย sync แรกหลังเที่ยงคืน ซึ่งคำนวณ `admitted`/`discharged`/`patientDays` ใหม่ทั้งวันจาก HOSxP และจะไม่เปลี่ยนอีก |
+| `wardName`, `departmentCode`, `departmentName` | ชื่อหอ / แผนก ณ วันนั้น |
+
+ข้อควรทราบ: ผู้ป่วยที่ย้ายหอจะถูกนับในหอปัจจุบัน/หอที่จำหน่าย (HOSxP `ipt.ward`)

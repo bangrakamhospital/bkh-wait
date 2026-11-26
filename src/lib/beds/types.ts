@@ -5,7 +5,10 @@
 /** departmentCode of the "ไม่ระบุแผนก" group (wards without a department). */
 export const NO_DEPARTMENT_CODE = "_none";
 
-/** Occupancy of one ward right now (HOSxP ipt with dchdate IS NULL). */
+/**
+ * Occupancy of one ward at the last HOSxP sync (PostgreSQL wait.ward_state,
+ * written by scripts/sync-hosxp.mjs; definitions in scripts/lib/hosxp.mjs).
+ */
 export type WardOccupancy = {
   wardCode: string;
   wardName: string;
@@ -66,8 +69,10 @@ export type DepartmentOccupancy = {
 };
 
 export type BedBoard = {
-  /** ISO timestamp the data was read. */
+  /** ISO time of the last successful HOSxP sync (the data is as of then). */
   asOf: string;
+  /** true when asOf is older than 30 minutes (sync worker not running). */
+  stale: boolean;
   wards: WardOccupancy[];
   departments: DepartmentOccupancy[];
   /** Hospital-wide occupied beds by spclty. */
@@ -91,6 +96,45 @@ export type OccupancyPoint = {
   beds: number;
   /** Beds in use (เตียงคนนอน) at that time; null for rows taken before migration 002. */
   bedsInUse: number | null;
+};
+
+/**
+ * Daily bed census of one ward (PostgreSQL wait.daily_census), one row per
+ * ward per day. Filled by the HOSxP sync job; also the payload of the
+ * central API (/api/v1/census).
+ */
+export type DailyCensus = {
+  date: string; // YYYY-MM-DD (Asia/Bangkok)
+  wardCode: string;
+  wardName: string;
+  departmentCode: string;
+  departmentName: string;
+  beds: number;
+  /** Beds in use at the last sync of the day (for a closed day: the last sync before midnight). */
+  bedsInUse: number;
+  /** max(beds - bedsInUse, 0) */
+  available: number;
+  /** (beds - available) / beds * 100, 1 decimal, 0 when beds = 0 */
+  occupancyPct: number;
+  /** Highest beds-in-use seen across that day's syncs. */
+  peakBedsInUse: number;
+  /** Admissions that day (ipt.regdate = date). */
+  admitted: number;
+  /** Discharges that day (ipt.dchdate = date). */
+  discharged: number;
+  /**
+   * Inpatient days = patients present at midnight at the end of the day.
+   * Provisional (= patients present now) until the day is finalized.
+   */
+  patientDays: number;
+  /**
+   * true once the day is closed: the first sync after midnight recomputes
+   * admitted / discharged / patientDays from HOSxP for the whole day and
+   * the row never changes again.
+   */
+  finalized: boolean;
+  /** ISO time of the last sync that updated this row. */
+  updatedAt: string;
 };
 
 export type ReferStatus = "waiting" | "accepted" | "admitted" | "cancelled";
