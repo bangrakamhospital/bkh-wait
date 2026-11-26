@@ -13,7 +13,7 @@ import {
 import { Canvas, useFrame, useThree } from "@react-three/fiber";
 import { Edges, Html, OrbitControls } from "@react-three/drei";
 import { CanvasTexture, Color, DynamicDrawUsage, MathUtils, Object3D, SRGBColorSpace, Vector3 } from "three";
-import type { Group, InstancedMesh, PerspectiveCamera } from "three";
+import type { Group, InstancedMesh, MeshBasicMaterial, PerspectiveCamera } from "three";
 import type { DepartmentOccupancy, WardOccupancy } from "@/lib/beds/types";
 import { BedGrid2D } from "./BedGrid2D";
 import { bedsInUse } from "./beds";
@@ -35,8 +35,6 @@ const MIN_ROOM_W = 6;
 const MIN_ROOM_D = 5;
 /** Walkway between every pair of bed columns, so nurses can reach any bed from an aisle. */
 const AISLE = 0.8;
-const BLANKET_A = new Color("#bfdbfe");
-const BLANKET_B = new Color("#e0f2fe");
 const MAX_NURSES = 15;
 
 const colOffset = (c: number) => c * BED_SX + Math.floor(c / 2) * AISLE;
@@ -306,7 +304,7 @@ function Beds({ items, anim }: { items: BedItem[]; anim: boolean }) {
   const blanket = useRef<InstancedMesh>(null);
   const states = useRef(new Map<string, BedState>());
   const invalidate = useThree((s) => s.invalidate);
-  const tmp = useMemo(() => ({ o: new Object3D(), c: new Color() }), []);
+  const tmp = useMemo(() => ({ o: new Object3D(), c: new Color(), bc: new Color() }), []);
 
   const apply = useCallback(
     (t: number, dt: number) => {
@@ -316,7 +314,7 @@ function Beds({ items, anim }: { items: BedItem[]; anim: boolean }) {
       const ph = pHead.current;
       const bl = blanket.current;
       if (!m || !h || !pl || !ph || !bl) return;
-      const { o, c } = tmp;
+      const { o, c, bc } = tmp;
       const k = 1 - Math.exp(-8 * dt);
       items.forEach((it, i) => {
         const st = states.current.get(it.key);
@@ -349,6 +347,10 @@ function Beds({ items, anim }: { items: BedItem[]; anim: boolean }) {
         o.position.set(it.x, base, it.z);
         o.updateMatrix();
         m.setMatrixAt(i, o.matrix);
+        // The blanket carries the status colour; the frame under it is a darker shade of the same colour.
+        const hs = hash01(it.i + it.wardIdx * 131);
+        bc.copy(c).multiplyScalar(0.92 + 0.08 * hs);
+        c.multiplyScalar(1 - 0.22 * st.pat);
         m.setColorAt(i, c);
         o.position.set(it.x, base + 0.2, it.z - 0.55);
         o.updateMatrix();
@@ -358,7 +360,6 @@ function Beds({ items, anim }: { items: BedItem[]; anim: boolean }) {
         pl.setMatrixAt(i, o.matrix);
         // Patient: head on the pillow + breathing blanket; scales in/out when the bed changes state.
         const ps = scale * st.pat;
-        const hs = hash01(it.i + it.wardIdx * 131);
         o.scale.setScalar(ps);
         o.position.set(it.x, base + 0.31, it.z - 0.36);
         o.updateMatrix();
@@ -368,7 +369,7 @@ function Beds({ items, anim }: { items: BedItem[]; anim: boolean }) {
         o.position.set(it.x, base + 0.125 + 0.07 * ps * breathe, it.z + 0.2);
         o.updateMatrix();
         bl.setMatrixAt(i, o.matrix);
-        bl.setColorAt(i, hs > 0.5 ? BLANKET_A : BLANKET_B);
+        bl.setColorAt(i, bc);
       });
       for (const mesh of [m, h, pl, ph, bl]) mesh.instanceMatrix.needsUpdate = true;
       if (m.instanceColor) m.instanceColor.needsUpdate = true;
@@ -425,11 +426,11 @@ function Beds({ items, anim }: { items: BedItem[]; anim: boolean }) {
       </instancedMesh>
       <instancedMesh key={`pl${n}`} ref={pillow} args={[undefined, undefined, n]} {...meshProps}>
         <boxGeometry args={[0.4, 0.08, 0.22]} />
-        <meshStandardMaterial color="#ffffff" />
+        <meshStandardMaterial color="#d1d5db" />
       </instancedMesh>
       <instancedMesh key={`ph${n}`} ref={pHead} args={[undefined, undefined, n]} {...meshProps}>
         <sphereGeometry args={[0.13, 12, 8]} />
-        <meshStandardMaterial color="#f1c9a5" />
+        <meshStandardMaterial color="#b9794a" />
       </instancedMesh>
       <instancedMesh key={`bl${n}`} ref={blanket} args={[undefined, undefined, n]} {...meshProps}>
         <boxGeometry args={[0.54, 0.14, 0.62]} />
@@ -586,7 +587,7 @@ function Nurses({ rooms, anim }: { rooms: RoomLayout[]; anim: boolean }) {
         g.scale.setScalar(Math.max(appear, 0.001));
         g.updateMatrixWorld(true);
         bm.setMatrixAt(i, b.matrixWorld);
-        bm.setColorAt(i, col.set(sp.n % 2 === 0 ? "#14b8a6" : "#f8fafc"));
+        bm.setColorAt(i, col.set("#0f766e"));
         hm.setMatrixAt(i, h.matrixWorld);
         cm.setMatrixAt(i, c.matrixWorld);
       });
@@ -642,7 +643,7 @@ function Nurses({ rooms, anim }: { rooms: RoomLayout[]; anim: boolean }) {
       </instancedMesh>
       <instancedMesh key={`nh${n}`} ref={head} args={[undefined, undefined, n]} {...meshProps}>
         <sphereGeometry args={[0.11, 10, 8]} />
-        <meshStandardMaterial color="#f1c9a5" />
+        <meshStandardMaterial color="#d9a679" />
       </instancedMesh>
       <instancedMesh key={`nc${n}`} ref={cap} args={[undefined, undefined, n]} {...meshProps}>
         <boxGeometry args={[0.2, 0.05, 0.2]} />
@@ -687,11 +688,28 @@ function FloorLabel({ text, width, z }: { text: string; width: number; z: number
     return t;
   }, [text, width]);
   useEffect(() => () => texture.dispose(), [texture]);
+  const group = useRef<Group>(null);
+  const material = useRef<MeshBasicMaterial>(null);
+  const wp = useMemo(() => new Vector3(), []);
+  useFrame(({ camera }, dt) => {
+    const g = group.current;
+    const m = material.current;
+    if (!g || !m) return;
+    g.getWorldPosition(wp);
+    const dx = camera.position.x - wp.x;
+    const dz = camera.position.z - wp.z;
+    // Flat on the floor, but turned so the text always reads upright from the camera side.
+    g.rotation.y = dampAngle(g.rotation.y, Math.atan2(dx, dz), 8, Math.min(dt, 0.1));
+    const elev = Math.atan2(camera.position.y - wp.y, Math.hypot(dx, dz));
+    m.opacity = clamp01((elev - 0.35) / 0.3);
+  });
   return (
-    <mesh position={[0, 0.1, z]} rotation={[-Math.PI / 2, 0, 0]}>
-      <planeGeometry args={[width, FLOOR_LABEL_H]} />
-      <meshBasicMaterial map={texture} transparent toneMapped={false} />
-    </mesh>
+    <group ref={group} position={[0, 0.3, z]}>
+      <mesh rotation={[-Math.PI / 2, 0, 0]}>
+        <planeGeometry args={[width, FLOOR_LABEL_H]} />
+        <meshBasicMaterial ref={material} map={texture} transparent toneMapped={false} />
+      </mesh>
+    </group>
   );
 }
 
@@ -703,7 +721,7 @@ function Zone({ zone }: { zone: ZoneLayout }) {
         <meshStandardMaterial color="#99d5cd" />
       </mesh>
       {/* Department tag lies flat on the floor in the zone's front margin, so it can never overlap a room. */}
-      <FloorLabel text={`แผนก${zone.name}`} width={Math.min(zone.w - 1, 12)} z={zone.d / 2 - LABEL_STRIP / 2} />
+      <FloorLabel text={`แผนก${zone.name}`} width={Math.min(zone.w - 1, 8)} z={zone.d / 2 - LABEL_STRIP / 2} />
     </group>
   );
 }
@@ -969,10 +987,10 @@ function Legend() {
         <span className={`${dot} bg-red-900`} /> เกินจำนวนเตียง
       </span>
       <span className="inline-flex items-center gap-1">
-        <span className={`${dot} rounded-full bg-orange-200 ring-1 ring-sky-300`} /> ผู้ป่วย
+        <span className={`${dot} rounded-full bg-[#b9794a]`} /> ผู้ป่วย
       </span>
       <span className="inline-flex items-center gap-1">
-        <span className={`${dot} rounded-full bg-teal-500`} /> พยาบาล
+        <span className={`${dot} rounded-full bg-teal-700`} /> พยาบาล
       </span>
     </div>
   );
