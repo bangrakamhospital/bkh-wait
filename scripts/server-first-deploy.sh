@@ -90,6 +90,7 @@ node --env-file=.env scripts/db-migrate.mjs
 echo "==> 6/9 first HOSxP sync (the board shows nothing before it)"
 mkdir -p "$APP_DIR/logs"
 node --env-file="$APP_DIR/.env.sync" scripts/sync-hosxp.mjs
+node --env-file="$APP_DIR/.env.sync" scripts/sync-opd.mjs --backfill=30
 
 echo "==> 7/9 pm2"
 if pm2 describe bkh-wait >/dev/null 2>&1; then
@@ -134,9 +135,10 @@ if sudo ufw status 2>/dev/null | grep -q "Status: active"; then
   sudo ufw allow 84/tcp
 fi
 
-echo "==> 9/9 cron: HOSxP sync every 15 min (only process with HIS_* credentials)"
+echo "==> 9/9 cron: HOSxP bed sync every 15 min + OPD sync every 5 min 06:00-20:55 (only processes with HIS_* credentials)"
 CRON="*/15 * * * * cd $APP_DIR && /usr/bin/node --env-file=$APP_DIR/.env.sync scripts/sync-hosxp.mjs >> $APP_DIR/logs/sync.log 2>&1"
-( { crontab -l 2>/dev/null || true; } | { grep -v "/var/www/wait" || true; } ; echo "$CRON" ) | crontab -
+OPD_CRON="*/5 6-20 * * * cd $APP_DIR && /usr/bin/node --env-file=$APP_DIR/.env.sync scripts/sync-opd.mjs >> $APP_DIR/logs/sync-opd.log 2>&1"
+( { crontab -l 2>/dev/null || true; } | { grep -v "/var/www/wait" || true; } ; echo "$CRON"; echo "$OPD_CRON" ) | crontab -
 
 sleep 3
 echo

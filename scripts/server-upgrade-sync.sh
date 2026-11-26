@@ -104,7 +104,8 @@ echo "==> $STEP"
 CRON="*/15 * * * * cd $APP_DIR && /usr/bin/node --env-file=$APP_DIR/.env.sync scripts/sync-hosxp.mjs >> $APP_DIR/logs/sync.log 2>&1"
 # `|| true`: crontab -l fails on an empty crontab and grep -v fails when it
 # removes every line; neither may abort under set -e / pipefail.
-( { crontab -l 2>/dev/null || true; } | { grep -v "/var/www/wait" || true; } ; echo "$CRON" ) | crontab -
+# Only the snapshot / bed-sync lines are replaced; the OPD line (sync-opd.mjs) is kept.
+( { crontab -l 2>/dev/null || true; } | { grep -vE "/var/www/wait.*(snapshot|sync-hosxp)\.mjs" || true; } ; echo "$CRON" ) | crontab -
 crontab -l | { grep "/var/www/wait" || true; } | sed 's/^/    /'
 sed -i -E "/${HIS_RE}/d; /^WAIT_SNAPSHOT_TOKEN=/d; /^WAIT_INTERNAL_URL=/d" .env
 chmod 600 .env
