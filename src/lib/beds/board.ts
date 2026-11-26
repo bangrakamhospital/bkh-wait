@@ -1,23 +1,9 @@
 import "server-only";
 
-import { isWaitDbConfigured, pgQuery } from "@/lib/db/pg";
+import { isWaitDbConfigured, pgQuery, WaitDbConfigError, withPgTransaction } from "@/lib/db/pg";
+import { ApiError } from "@/lib/http";
 
-import {
-  applyConfig,
-  loadConfigOrNull,
-  NO_DEPARTMENT_CODE,
-  NO_DEPARTMENT_NAME,
-  type CatalogWard,
-  type StoredConfig,
-} from "./config";
-import {
-  fetchActiveWards,
-  fetchDominantSpclty,
-  fetchSpcltyCensus,
-  fetchWardCensus,
-  type HisSpcltyCount,
-  type HisWardCensus,
-} from "./his-source";
+import { CATALOG_COLUMNS, toCatalogWard, type CatalogRow, type CatalogWard } from "./config";
 import { countWaitingByWard } from "./refer";
 import type {
   BedBoard,
@@ -35,18 +21,19 @@ export {
 } from "./refer";
 
 /**
- * Bed board = HOSxP census (read-only, aggregates) + PostgreSQL overrides.
- * See ./his-source.ts for the SQL definitions.
+ * Bed board, read ONLY from PostgreSQL: the last successful HOSxP sync
+ * (scripts/sync-hosxp.mjs writes wait.his_ward / ward_state /
+ * ward_spclty_state / sync_run) + ward_config overrides, merged by the view
+ * wait.ward_catalog (name, capacity, visible, virtual, department). HOSxP
+ * definitions: scripts/lib/hosxp.mjs.
  *
- * - Virtual wards (ward_config.is_virtual; default ward 17 Home Ward) and
- *   hidden wards (visible = false) never appear: not in wards,
- *   departments, bySpclty or totals.
- * - Department of a ward: ward_config.department_code; a ward with a
- *   config row but no department -> "_none"; a ward without a config row
- *   (or PostgreSQL not configured) -> its dominant spclty of the last year
- *   (code "sp-<spclty>"), or "_none" without history.
+ * - Virtual wards (ward 17 Home Ward by default) and hidden wards never
+ *   appear: not in wards, departments, bySpclty or totals.
+ * - asOf = finish time of the last successful sync; stale when older than
+ *   STALE_AFTER_MS (cron runs every 15 min, so two missed runs).
  */
 
+export const STALE_AFTER_MS = 30 * 60 * 1000;
 const BOARD_TTL_MS = 10_000;
 const store = globalThis as unknown as {
   __waitBoard?: { at: number; value: Promise<BedBoard> };
@@ -77,32 +64,6 @@ function mergeCounts(lists: DepartmentCount[][]): DepartmentCount[] {
   return [...m.values()].sort(bySpcltyDesc);
 }
 
-interface WardStats {
-  ward: CatalogWard;
-  census: HisWardCensus;
-  spclty: DepartmentCount[];
-}
-
-/** All active wards with census (incl. hidden / virtual; callers filter). */
-async function collectWardStats(cfg: StoredConfig | null): Promise<WardStats[]> {
-  const [his, census, spclty] = await Promise.all([
-    fetchActiveWards(),
-    fetchWardCensus(),
-    fetchSpcltyCensus(),
-  ]);
-  const spByWard = new Map<string, DepartmentCount[]>();
-  for (const s of spclty as HisSpcltyCount[]) {
-    const list = spByWard.get(s.wardCode) ?? [];
-    list.push({ spcltyCode: s.spcltyCode, spcltyName: s.spcltyName, occupied: s.occupied });
-    spByWard.set(s.wardCode, list);
-  }
-  return applyConfig(his, cfg).map((ward) => ({
-    ward,
-    census: census.get(ward.wardCode) ?? { occupied: 0, bedsInUse: 0, admittedToday: 0, dischargedToday: 0 },
-    spclty: (spByWard.get(ward.wardCode) ?? []).sort(bySpcltyDesc),
-  }));
-}
-
 function occupancyOf(beds: number, occupied: number, bedsInUse: number) {
   const inUse = Math.min(bedsInUse, occupied);
   const available = Math.max(beds - inUse, 0);
@@ -113,52 +74,89 @@ function occupancyOf(beds: number, occupied: number, bedsInUse: number) {
   };
 }
 
+interface StateRow {
+  ward_code: string;
+  occupied: number;
+  beds_in_use: number;
+  admitted_today: number;
+  discharged_today: number;
+}
+
+interface SyncState {
+  asOf: string;
+  wards: { ward: CatalogWard; state: StateRow | undefined }[];
+  spclty: Map<string, DepartmentCount[]>;
+}
+
+/** Shown wards + their state from the last committed sync (one snapshot). */
+async function readSyncState(): Promise<SyncState> {
+  if (!isWaitDbConfigured()) throw new WaitDbConfigError("wait database is not configured");
+  return withPgTransaction(
+    async (tx) => {
+      const [last] = await tx.query<{ finished_at: string }>(
+        "SELECT finished_at FROM sync_run WHERE ok ORDER BY finished_at DESC LIMIT 1",
+      );
+      if (!last) {
+        throw new ApiError(503, "SYNC_NOT_READY", "ยังไม่มีข้อมูลเตียงจากการซิงก์ HOSxP");
+      }
+      const catalog = await tx.query<CatalogRow>(
+        `SELECT ${CATALOG_COLUMNS} FROM ward_catalog
+          WHERE active AND visible AND NOT is_virtual
+          ORDER BY sort_order, ward_code`,
+      );
+      const states = await tx.query<StateRow>(
+        "SELECT ward_code, occupied, beds_in_use, admitted_today, discharged_today FROM ward_state",
+      );
+      const sp = await tx.query<{ ward_code: string; spclty_code: string; spclty_name: string; occupied: number }>(
+        `SELECT x.ward_code, x.spclty_code,
+                coalesce(nullif(btrim(s.name), ''), 'ไม่ระบุ') AS spclty_name, x.occupied
+           FROM ward_spclty_state x
+           LEFT JOIN his_spclty s ON s.spclty_code = x.spclty_code`,
+      );
+      const stateBy = new Map(states.map((r) => [r.ward_code, r]));
+      const spclty = new Map<string, DepartmentCount[]>();
+      for (const r of sp) {
+        const list = spclty.get(r.ward_code) ?? [];
+        list.push({ spcltyCode: r.spclty_code, spcltyName: r.spclty_name, occupied: r.occupied });
+        spclty.set(r.ward_code, list);
+      }
+      for (const list of spclty.values()) list.sort(bySpcltyDesc);
+      return {
+        asOf: last.finished_at,
+        wards: catalog.map((r) => ({ ward: toCatalogWard(r), state: stateBy.get(r.ward_code) })),
+        spclty,
+      };
+    },
+    { snapshot: true },
+  );
+}
+
 async function buildBoard(): Promise<BedBoard> {
-  const cfg = await loadConfigOrNull();
-  const [stats, waiting] = await Promise.all([collectWardStats(cfg), countWaitingByWard()]);
-  const shown = stats
-    .filter((s) => s.ward.visible && !s.ward.isVirtual)
-    .sort((a, b) => a.ward.sortOrder - b.ward.sortOrder || a.ward.wardCode.localeCompare(b.ward.wardCode));
-
-  // Fallback grouping only when some shown ward has no config row.
-  const dominant = shown.some((s) => !s.ward.config) ? await fetchDominantSpclty() : new Map();
-
-  const groupOf = (w: CatalogWard): { code: string; name: string; sort: number } => {
-    if (w.config) {
-      const d = w.config.departmentCode ? cfg?.departments.get(w.config.departmentCode) : undefined;
-      return d
-        ? { code: d.departmentCode, name: d.name, sort: d.sortOrder }
-        : { code: NO_DEPARTMENT_CODE, name: NO_DEPARTMENT_NAME, sort: Number.MAX_SAFE_INTEGER };
-    }
-    const dom = dominant.get(w.wardCode);
-    return dom
-      ? { code: `sp-${dom.spcltyCode}`, name: dom.spcltyName, sort: 5000 }
-      : { code: NO_DEPARTMENT_CODE, name: NO_DEPARTMENT_NAME, sort: Number.MAX_SAFE_INTEGER };
-  };
+  const [sync, waiting] = await Promise.all([readSyncState(), countWaitingByWard()]);
 
   const wards: WardOccupancy[] = [];
   const groups = new Map<string, { name: string; sort: number; wards: WardOccupancy[] }>();
-  for (const s of shown) {
-    const g = groupOf(s.ward);
-    const occ = occupancyOf(s.ward.beds, s.census.occupied, s.census.bedsInUse);
+  for (const { ward: w, state } of sync.wards) {
+    const occupied = state?.occupied ?? 0;
+    const occ = occupancyOf(w.beds, occupied, state?.beds_in_use ?? 0);
     const row: WardOccupancy = {
-      wardCode: s.ward.wardCode,
-      wardName: s.ward.wardName,
-      beds: s.ward.beds,
-      occupied: s.census.occupied,
+      wardCode: w.wardCode,
+      wardName: w.wardName,
+      beds: w.beds,
+      occupied,
       occupiedNoBed: occ.occupiedNoBed,
       available: occ.available,
       occupancyPct: occ.occupancyPct,
-      admittedToday: s.census.admittedToday,
-      dischargedToday: s.census.dischargedToday,
-      referWaiting: waiting.get(s.ward.wardCode) ?? 0,
-      departmentCode: g.code,
-      byDepartment: s.spclty,
+      admittedToday: state?.admitted_today ?? 0,
+      dischargedToday: state?.discharged_today ?? 0,
+      referWaiting: waiting.get(w.wardCode) ?? 0,
+      departmentCode: w.departmentCode,
+      byDepartment: sync.spclty.get(w.wardCode) ?? [],
     };
     wards.push(row);
-    const grp = groups.get(g.code) ?? { name: g.name, sort: g.sort, wards: [] };
+    const grp = groups.get(w.departmentCode) ?? { name: w.departmentName, sort: w.departmentSort, wards: [] };
     grp.wards.push(row);
-    groups.set(g.code, grp);
+    groups.set(w.departmentCode, grp);
   }
 
   const sum = (list: WardOccupancy[], k: "beds" | "occupied" | "occupiedNoBed" | "available" | "referWaiting") =>
@@ -189,7 +187,8 @@ async function buildBoard(): Promise<BedBoard> {
   for (const n of waiting.values()) referWaiting += n;
 
   return {
-    asOf: new Date().toISOString(),
+    asOf: sync.asOf,
+    stale: Date.now() - new Date(sync.asOf).getTime() > STALE_AFTER_MS,
     wards,
     departments,
     bySpclty: mergeCounts(wards.map((w) => w.byDepartment)),
@@ -206,7 +205,7 @@ async function buildBoard(): Promise<BedBoard> {
 
 /**
  * Current bed board. Memoised for 10 s per process so many browsers
- * polling the public board cost HOSxP one set of queries.
+ * polling the public board cost PostgreSQL one set of queries.
  */
 export function getBedBoard(): Promise<BedBoard> {
   const now = Date.now();
@@ -249,35 +248,4 @@ export async function getOccupancyTrend(hours: number, wardCode?: string | null)
     beds: r.beds,
     bedsInUse: r.beds_in_use,
   }));
-}
-
-/**
- * Writes one occupancy_snapshot row per non-virtual active ward (hidden
- * wards included, so history survives un-hiding). The timestamp is
- * truncated to the minute; a second call within the same minute is a no-op.
- */
-export async function takeOccupancySnapshot(): Promise<{ takenAt: string; wards: number }> {
-  const cfg = await loadConfigOrNull();
-  if (!cfg) {
-    // Requires PostgreSQL: surfaces as 503 WAIT_DB_NOT_CONFIGURED / INTERNAL.
-    await pgQuery("SELECT 1");
-  }
-  const stats = (await collectWardStats(cfg)).filter((s) => !s.ward.isVirtual);
-  const codes = stats.map((s) => s.ward.wardCode);
-  const occupied = stats.map((s) => s.census.occupied);
-  const beds = stats.map((s) => s.ward.beds);
-  // Same clamp as occupancyOf: never more beds in use than patients.
-  const bedsInUse = stats.map((s) => Math.min(s.census.bedsInUse, s.census.occupied));
-  const [row] = await pgQuery<{ taken_at: string }>(
-    `WITH t AS (SELECT date_trunc('minute', now()) AS taken_at),
-          ins AS (
-            INSERT INTO occupancy_snapshot (taken_at, ward_code, occupied, beds, beds_in_use)
-            SELECT t.taken_at, x.ward_code, x.occupied, x.beds, x.beds_in_use
-              FROM t, unnest($1::text[], $2::int[], $3::int[], $4::int[]) AS x(ward_code, occupied, beds, beds_in_use)
-            ON CONFLICT (taken_at, ward_code) DO NOTHING
-          )
-     SELECT taken_at FROM t`,
-    [codes, occupied, beds, bedsInUse],
-  );
-  return { takenAt: row.taken_at, wards: codes.length };
 }

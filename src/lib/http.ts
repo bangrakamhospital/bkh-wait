@@ -2,7 +2,6 @@ import "server-only";
 
 import { getSession, type Session } from "./auth/session";
 import type { Role } from "./auth/users";
-import { HisConfigError, HisQueryError } from "./db/his";
 import { WaitDbConfigError, WaitDbError } from "./db/pg";
 
 /**
@@ -21,7 +20,9 @@ export type ErrorCode =
   | "TOO_MANY_ATTEMPTS"
   | "AUTH_NOT_CONFIGURED"
   | "WAIT_DB_NOT_CONFIGURED"
-  | "HIS_UNAVAILABLE"
+  | "SYNC_NOT_READY"
+  | "API_NOT_CONFIGURED"
+  | "RATE_LIMITED"
   | "INTERNAL";
 
 export class ApiError extends Error {
@@ -59,10 +60,6 @@ export function errorResponse(err: unknown, label: string): Response {
       { error: "ยังไม่ได้ตั้งค่าฐานข้อมูลระบบรับกลับ (WAIT_DATABASE_URL)", code: "WAIT_DB_NOT_CONFIGURED" },
       503,
     );
-  }
-  if (err instanceof HisConfigError || err instanceof HisQueryError) {
-    console.error(`[${label}] ${err.message}`);
-    return json({ error: "อ่านข้อมูลจาก HOSxP ไม่ได้ในขณะนี้", code: "HIS_UNAVAILABLE" }, 503);
   }
   if (err instanceof WaitDbError) {
     console.error(`[${label}] ${err.message}${err.constraint ? ` ${err.constraint}` : ""}`);

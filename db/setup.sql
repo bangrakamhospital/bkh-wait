@@ -13,8 +13,16 @@
 --   bkh_wait_app    the web app: CONNECT + SELECT/INSERT/UPDATE/DELETE on the
 --                   tables of schema wait, nothing else (no DDL, no other DB).
 --                   audit_log additionally refuses UPDATE/DELETE by trigger;
---                   schema_migrations is SELECT-only (db/002 revokes writes).
--- The HOSxP database is NOT touched by anything here.
+--                   schema_migrations is SELECT-only (db/002 revokes writes);
+--                   the HOSxP copies (his_ward, ward_state, daily_census,
+--                   sync_run, occupancy_snapshot, ...) are SELECT-only
+--                   (db/003 + db/004 revoke writes).
+--   bkh_wait_sync   the HOSxP sync worker (scripts/sync-hosxp.mjs): created
+--                   by db/sync-role.sql via scripts/db-sync-role.sh (called
+--                   by db-setup.sh after this file, before the migrations);
+--                   table privileges come from db/003_hosxp_sync.sql.
+-- The HOSxP database is NOT touched by anything here, and the web app has no
+-- HOSxP credentials: only the sync worker's .env.sync does.
 
 CREATE ROLE bkh_wait_owner LOGIN PASSWORD :'owner_pw'
   NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION CONNECTION LIMIT 5;

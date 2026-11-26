@@ -4,13 +4,14 @@ import pg from "pg";
 
 /**
  * bkh-wait database (PostgreSQL `bkh_wait`, schema `wait`) — the ONLY
- * database this app writes to. HOSxP stays read-only (./his.ts).
+ * database this app talks to. The web app never connects to HOSxP: the
+ * sync worker (scripts/sync-hosxp.mjs) copies aggregate counts into the
+ * wait.his_ward / ward_state / daily_census tables, which this app reads.
  *
  * Env (server-only, never NEXT_PUBLIC_):
  *   WAIT_DATABASE_URL  postgres://bkh_wait_app:<password>@127.0.0.1:5432/bkh_wait
- * Not configured -> isWaitDbConfigured() false: the bed board still works
- * from HOSxP alone (no overrides, referWaiting 0, empty trend) and every
- * refer-back API answers 503 WAIT_DB_NOT_CONFIGURED.
+ * Not configured -> isWaitDbConfigured() false: every API that needs data
+ * answers 503 WAIT_DB_NOT_CONFIGURED (the trend answers an empty list).
  *
  * Every connection: search_path wait, time zone Asia/Bangkok, statement
  * timeout 15 s, lock timeout 5 s, idle-in-transaction timeout 60 s.
@@ -144,11 +145,14 @@ export async function pgQuery<R extends pg.QueryResultRow = pg.QueryResultRow>(
 }
 
 /**
- * Run `fn` in one READ COMMITTED transaction (BEGIN / COMMIT, ROLLBACK on
- * any throw). Use SELECT .. FOR UPDATE inside for row locks.
+ * Run `fn` in one transaction (BEGIN / COMMIT, ROLLBACK on any throw).
+ * Default READ COMMITTED (use SELECT .. FOR UPDATE inside for row locks);
+ * `{ snapshot: true }` = REPEATABLE READ READ ONLY, so several SELECTs see
+ * the same committed sync run.
  */
 export async function withPgTransaction<T>(
   fn: (tx: Queryable) => Promise<T>,
+  opts: { snapshot?: boolean } = {},
 ): Promise<T> {
   let client: pg.PoolClient;
   try {
@@ -159,7 +163,7 @@ export async function withPgTransaction<T>(
   const tx = bind((s, p) => client.query(s, p));
   let broken = false;
   try {
-    await tx.query("BEGIN");
+    await tx.query(opts.snapshot ? "BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY" : "BEGIN");
     const result = await fn(tx);
     await tx.query("COMMIT");
     return result;

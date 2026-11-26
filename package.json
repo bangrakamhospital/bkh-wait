@@ -8,7 +8,8 @@
     "start": "next start -H 127.0.0.1 -p 3084",
     "lint": "eslint",
     "db:migrate": "node --env-file-if-exists=.env --env-file-if-exists=.env.local scripts/db-migrate.mjs",
-    "snapshot": "node --env-file-if-exists=.env scripts/snapshot.mjs"
+    "sync": "node --env-file-if-exists=.env.sync scripts/sync-hosxp.mjs",
+    "sync:dry": "node --env-file-if-exists=.env.sync scripts/sync-hosxp.mjs --dry-run"
   },
   "dependencies": {
     "@react-three/drei": "^10.7.9",

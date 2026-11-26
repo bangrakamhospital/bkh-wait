@@ -1,16 +1,20 @@
 import "server-only";
 
-import { isWaitDbConfigured, pgQuery, WaitDbConfigError, WaitDbError, withPgTransaction } from "@/lib/db/pg";
+import { isWaitDbConfigured, pgQuery, WaitDbConfigError, withPgTransaction } from "@/lib/db/pg";
 import { validation } from "@/lib/http";
-
-import { fetchActiveWards, type HisWard } from "./his-source";
 
 /**
  * Ward overrides + bed departments (PostgreSQL wait.ward_config /
- * wait.department) merged with the HOSxP ward list.
+ * wait.department) on top of the HOSxP ward list that the sync worker
+ * copies into wait.his_ward. The merge itself is the view
+ * wait.ward_catalog (db/003_hosxp_sync.sql) — the one definition of ward
+ * name, capacity, visibility, virtual flag and department.
  */
 
-/** Wards treated as virtual when they have no ward_config row (or PG is not set up). */
+/**
+ * Wards treated as virtual when they have no ward_config row. Must match
+ * the default in the wait.ward_catalog view.
+ */
 export const DEFAULT_VIRTUAL_WARDS: ReadonlySet<string> = new Set(["17"]);
 
 export { NO_DEPARTMENT_CODE } from "./types";
@@ -32,106 +36,78 @@ export interface DepartmentRow {
   sortOrder: number;
 }
 
-export interface StoredConfig {
-  wards: Map<string, WardConfigRow>;
-  departments: Map<string, DepartmentRow>;
-}
-
-/** A HOSxP active ward with its config applied. */
+/** One active HOSxP ward with its config applied (a wait.ward_catalog row). */
 export interface CatalogWard {
   wardCode: string;
   hisName: string;
   hisBeds: number;
+  hasConfig: boolean;
+  displayName: string | null;
+  bedCapacity: number | null;
+  configDepartmentCode: string | null;
   wardName: string;
   beds: number;
   visible: boolean;
   isVirtual: boolean;
   sortOrder: number;
-  /** null = no ward_config row (fallback grouping applies). */
-  config: WardConfigRow | null;
+  departmentCode: string;
+  departmentName: string;
+  departmentSort: number;
 }
 
-async function readConfig(): Promise<StoredConfig> {
-  const [wards, departments] = await Promise.all([
-    pgQuery<{
-      ward_code: string;
-      display_name: string | null;
-      bed_capacity: number | null;
-      visible: boolean;
-      is_virtual: boolean;
-      sort_order: number;
-      department_code: string | null;
-    }>(
-      `SELECT ward_code, display_name, bed_capacity, visible, is_virtual, sort_order, department_code
-         FROM ward_config`,
-    ),
-    pgQuery<{ department_code: string; name: string; sort_order: number }>(
-      "SELECT department_code, name, sort_order FROM department",
-    ),
-  ]);
+export interface CatalogRow {
+  ward_code: string;
+  his_name: string;
+  his_beds: number;
+  has_config: boolean;
+  display_name: string | null;
+  bed_capacity: number | null;
+  config_department_code: string | null;
+  ward_name: string;
+  beds: number;
+  visible: boolean;
+  is_virtual: boolean;
+  sort_order: number;
+  department_code: string;
+  department_name: string;
+  department_sort: number;
+}
+
+export const CATALOG_COLUMNS = `ward_code, his_name, his_beds, has_config, display_name, bed_capacity,
+  config_department_code, ward_name, beds, visible, is_virtual, sort_order,
+  department_code, department_name, department_sort`;
+
+export function toCatalogWard(r: CatalogRow): CatalogWard {
   return {
-    wards: new Map(
-      wards.map((w) => [
-        w.ward_code,
-        {
-          wardCode: w.ward_code,
-          displayName: w.display_name,
-          bedCapacity: w.bed_capacity,
-          visible: w.visible,
-          isVirtual: w.is_virtual,
-          sortOrder: w.sort_order,
-          departmentCode: w.department_code,
-        },
-      ]),
-    ),
-    departments: new Map(
-      departments.map((d) => [
-        d.department_code,
-        { departmentCode: d.department_code, name: d.name, sortOrder: d.sort_order },
-      ]),
-    ),
+    wardCode: r.ward_code,
+    hisName: r.his_name,
+    hisBeds: r.his_beds,
+    hasConfig: r.has_config,
+    displayName: r.display_name,
+    bedCapacity: r.bed_capacity,
+    configDepartmentCode: r.config_department_code,
+    wardName: r.ward_name,
+    beds: r.beds,
+    visible: r.visible,
+    isVirtual: r.is_virtual,
+    sortOrder: r.sort_order,
+    departmentCode: r.department_code,
+    departmentName: r.department_name,
+    departmentSort: r.department_sort,
   };
 }
 
-/**
- * Stored config, or null when PostgreSQL is not configured / unreachable
- * (the board then falls back to HOSxP defaults instead of failing).
- */
-export async function loadConfigOrNull(): Promise<StoredConfig | null> {
-  if (!isWaitDbConfigured()) return null;
-  try {
-    return await readConfig();
-  } catch (err) {
-    if (err instanceof WaitDbConfigError) return null;
-    if (err instanceof WaitDbError) {
-      console.error(`[beds] ward config unavailable, using HOSxP defaults: ${err.message}`);
-      return null;
-    }
-    throw err;
-  }
+function requirePg(): void {
+  if (!isWaitDbConfigured()) throw new WaitDbConfigError("wait database is not configured");
 }
 
-export function applyConfig(his: HisWard[], cfg: StoredConfig | null): CatalogWard[] {
-  return his.map((w) => {
-    const c = cfg?.wards.get(w.wardCode) ?? null;
-    return {
-      wardCode: w.wardCode,
-      hisName: w.wardName,
-      hisBeds: w.beds,
-      wardName: c?.displayName?.trim() || w.wardName,
-      beds: c?.bedCapacity ?? w.beds,
-      visible: c?.visible ?? true,
-      isVirtual: c ? c.isVirtual : DEFAULT_VIRTUAL_WARDS.has(w.wardCode),
-      sortOrder: c?.sortOrder ?? 1000,
-      config: c,
-    };
-  });
-}
-
-/** Active HOSxP wards with config applied (HOSxP must be reachable). */
+/** Active HOSxP wards (as of the last sync) with config applied. */
 export async function getWardCatalog(): Promise<CatalogWard[]> {
-  const [his, cfg] = await Promise.all([fetchActiveWards(), loadConfigOrNull()]);
-  return applyConfig(his, cfg);
+  requirePg();
+  const rows = await pgQuery<CatalogRow>(
+    `SELECT ${CATALOG_COLUMNS} FROM ward_catalog WHERE active ORDER BY sort_order, ward_code`,
+  );
+  return rows.map(toCatalogWard);
 }
 
 /** Throws 400 unless `wardCode` is an active, non-virtual ward. */
@@ -161,39 +137,35 @@ export interface DepartmentSettings {
   }[];
 }
 
-function requirePg(): void {
-  if (!isWaitDbConfigured()) throw new WaitDbConfigError("wait database is not configured");
-}
-
 export async function getDepartmentSettings(): Promise<DepartmentSettings> {
   requirePg();
-  const [his, cfg] = await Promise.all([fetchActiveWards(), readConfig()]);
-  const catalog = applyConfig(his, cfg);
-  const departments = [...cfg.departments.values()]
-    .sort((a, b) => a.sortOrder - b.sortOrder || a.departmentCode.localeCompare(b.departmentCode))
-    .map((d) => ({
-      ...d,
-      wardCodes: catalog
-        .filter((w) => w.config?.departmentCode === d.departmentCode)
-        .map((w) => w.wardCode),
-    }));
+  const [catalog, depts] = await Promise.all([
+    getWardCatalog(),
+    pgQuery<{ department_code: string; name: string; sort_order: number }>(
+      "SELECT department_code, name, sort_order FROM department ORDER BY sort_order, department_code",
+    ),
+  ]);
   return {
-    departments,
-    wards: catalog
-      .sort((a, b) => a.sortOrder - b.sortOrder || a.wardCode.localeCompare(b.wardCode))
-      .map((w) => ({
-        wardCode: w.wardCode,
-        hisName: w.hisName,
-        hisBeds: w.hisBeds,
-        displayName: w.config?.displayName ?? null,
-        bedCapacity: w.config?.bedCapacity ?? null,
-        visible: w.visible,
-        isVirtual: w.isVirtual,
-        sortOrder: w.config?.sortOrder ?? 1000,
-        departmentCode: w.config?.departmentCode ?? null,
-      })),
+    departments: depts.map((d) => ({
+      departmentCode: d.department_code,
+      name: d.name,
+      sortOrder: d.sort_order,
+      wardCodes: catalog.filter((w) => w.configDepartmentCode === d.department_code).map((w) => w.wardCode),
+    })),
+    wards: catalog.map((w) => ({
+      wardCode: w.wardCode,
+      hisName: w.hisName,
+      hisBeds: w.hisBeds,
+      displayName: w.displayName,
+      bedCapacity: w.bedCapacity,
+      visible: w.visible,
+      isVirtual: w.isVirtual,
+      sortOrder: w.sortOrder,
+      departmentCode: w.configDepartmentCode,
+    })),
   };
 }
+
 
 const DEPT_CODE_RE = /^[a-z0-9][a-z0-9_-]{0,19}$/;
 
@@ -283,7 +255,7 @@ export async function putDepartmentSettings(
   actor: string,
 ): Promise<DepartmentSettings> {
   requirePg();
-  const active = new Set((await fetchActiveWards()).map((w) => w.wardCode));
+  const active = new Set((await getWardCatalog()).map((w) => w.wardCode));
   const parsed = parsePut(body, active);
   await withPgTransaction(async (tx) => {
     // Serialise concurrent edits of the whole grouping.
