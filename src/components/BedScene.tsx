@@ -1,6 +1,8 @@
 "use client";
 
 import {
+  createContext,
+  useContext,
   useCallback,
   useEffect,
   useLayoutEffect,
@@ -9,6 +11,7 @@ import {
   useState,
   useSyncExternalStore,
   type ComponentRef,
+  type RefObject,
 } from "react";
 import { Canvas, useFrame, useThree } from "@react-three/fiber";
 import { Edges, Html, OrbitControls } from "@react-three/drei";
@@ -653,7 +656,16 @@ function Nurses({ rooms, anim }: { rooms: RoomLayout[]; anim: boolean }) {
   );
 }
 
+/**
+ * DOM container for drei <Html> labels. Without an explicit portal the very
+ * first <Html> mounted in the scene was never attached to the page (it resolved
+ * its target before the canvas wrapper existed), which hid the first
+ * department pill. All labels portal into the canvas box instead.
+ */
+const LabelPortal = createContext<RefObject<HTMLElement> | null>(null);
+
 function Zone({ zone }: { zone: ZoneLayout }) {
+  const portal = useContext(LabelPortal) ?? undefined;
   return (
     <group position={[zone.cx, 0, zone.cz]}>
       <mesh position={[0, 0.02, 0]}>
@@ -661,7 +673,7 @@ function Zone({ zone }: { zone: ZoneLayout }) {
         <meshStandardMaterial color="#99d5cd" />
       </mesh>
       {/* Department pill: screen-aligned, at the zone front edge at floor level; never rotates. */}
-      <Html position={[0, 0.2, zone.d / 2 - 0.8]} center zIndexRange={[5, 0]} pointerEvents="none">
+      <Html portal={portal} position={[0, 0.2, zone.d / 2 - 0.8]} center zIndexRange={[5, 0]} pointerEvents="none">
         <div className="translate-y-1 whitespace-nowrap rounded-md bg-brand-700 px-3 py-0.5 text-xs font-semibold text-white shadow">
           แผนก{zone.name}
         </div>
@@ -689,6 +701,7 @@ function Room({
   const inner = useRef<Group>(null);
   const tone = occupancyTone(ward.occupancyPct);
   const over = bedsInUse(ward) > ward.beds;
+  const portal = useContext(LabelPortal) ?? undefined;
 
   useFrame((_, dt) => {
     const g = inner.current;
@@ -739,6 +752,7 @@ function Room({
         </mesh>
         {showLabel ? (
           <Html
+            portal={portal}
             position={[0, 1.4 + (room.col % 2) * 1.5, -d / 2 + 0.6]}
             center
             zIndexRange={[20, 0]}
@@ -1042,6 +1056,7 @@ export default function BedScene({
           dpr={[1, 1.5]}
           camera={{ position: [0, 60, 50], fov: 45, far: 600 }}
         >
+          <LabelPortal.Provider value={box as RefObject<HTMLElement>}>
           <Scene
             layout={layout}
             activeCode={activeCode}
@@ -1052,6 +1067,7 @@ export default function BedScene({
             onHover={setHovered}
             onSelect={(code) => setView((v) => ({ kind: "ward", code, n: v.n + 1 }))}
           />
+          </LabelPortal.Provider>
         </Canvas>
         {active ? (
           <div className="absolute bottom-3 left-3 max-w-xs rounded-md bg-white/90 p-2 shadow">
