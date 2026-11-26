@@ -7,6 +7,7 @@ import { Color, DynamicDrawUsage, MathUtils, Object3D } from "three";
 import type { Group, InstancedMesh, PerspectiveCamera } from "three";
 import type { ClinicWait } from "@/lib/opd/types";
 import { fmtNum, waitTone, type Tone } from "../format";
+import { NAV_CONTROL_PROPS, NavDriver, NavPad, useNavHold, useNavKeys } from "../scene3dNav";
 import { LabelPortal, clamp01, detectWebGL, goalPose, hash01, now, readAnimPref, writeAnimPref, type Goal } from "../scene3d";
 import {
   DepthFog,
@@ -499,7 +500,7 @@ function Rig({ goal }: { goal: Goal }) {
     c.update();
     invalidate();
   }, [goal, size.width, size.height, camera, invalidate]);
-  return <OrbitControls ref={controls} makeDefault maxPolarAngle={Math.PI / 2.3} minDistance={6} maxDistance={220} />;
+  return <OrbitControls ref={controls} makeDefault {...NAV_CONTROL_PROPS} maxPolarAngle={Math.PI / 2.3} minDistance={6} maxDistance={220} />;
 }
 
 /** Tiled hall floor. */
@@ -573,9 +574,12 @@ export default function OpdScene({ clinics }: { clinics: ClinicWait[] }) {
   const box = useRef<HTMLDivElement>(null);
   const hall = useMemo(() => layoutHall(clinics), [clinics]);
   const glProps = useMemo(() => canvasProps(quality), [quality]);
+  const [resetN, setResetN] = useState(0);
+  const nav = useNavHold();
+  useNavKeys(box, nav);
   const goal = useMemo<Goal>(
-    () => ({ key: `${hall.width}x${hall.depth}`, cx: 0, cz: hall.depth * 0.07, w: hall.width, d: hall.depth * 0.95, margin: 1 }),
-    [hall.width, hall.depth],
+    () => ({ key: `${hall.width}x${hall.depth}:${resetN}`, cx: 0, cz: hall.depth * 0.07, w: hall.width, d: hall.depth * 0.95, margin: 1 }),
+    [hall.width, hall.depth, resetN],
   );
 
   // Stop rendering while the canvas is scrolled out of view.
@@ -598,7 +602,12 @@ export default function OpdScene({ clinics }: { clinics: ClinicWait[] }) {
 
   return (
     <div className="space-y-2">
-      <div ref={box} className="relative h-[520px] overflow-hidden rounded-md bg-brand-50 lg:h-[680px]">
+      <div
+        ref={box}
+        tabIndex={0}
+        aria-label="ภาพ 3 มิติ ห้องตรวจผู้ป่วยนอก ใช้ลูกศรเพื่อเลื่อน"
+        className="relative h-[520px] overflow-hidden rounded-md bg-brand-50 outline-none focus-visible:ring-2 focus-visible:ring-brand-400 lg:h-[680px]"
+      >
         <Canvas
           key={quality}
           {...glProps}
@@ -608,7 +617,11 @@ export default function OpdScene({ clinics }: { clinics: ClinicWait[] }) {
           <LabelPortal.Provider value={box as RefObject<HTMLElement>}>
             <Scene hall={hall} anim={anim} goal={goal} quality={quality} />
           </LabelPortal.Provider>
+          <NavDriver nav={nav} w={hall.width} d={hall.depth} />
         </Canvas>
+        <div className="absolute bottom-3 right-3 z-30">
+          <NavPad nav={nav} onReset={() => setResetN((n) => n + 1)} />
+        </div>
         <div className="absolute right-3 top-3 flex flex-col items-end gap-2">
           <button type="button" className={buttonGhostClass} aria-pressed={anim} onClick={toggleAnim}>
             ภาพเคลื่อนไหว {anim ? "เปิด" : "ปิด"}

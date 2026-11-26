@@ -23,6 +23,7 @@ import { bedsInUse } from "./beds";
 import { fmtNum, occupancyTone } from "./format";
 import { buttonGhostClass } from "./ui";
 import { WardDetail } from "./WardDetail";
+import { NAV_CONTROL_PROPS, NavDriver, NavPad, useNavHold, useNavKeys } from "./scene3dNav";
 import { ANIM_KEY, LabelPortal, clamp01, detectWebGL, goalPose, hash01, now, readAnimPref, type Goal } from "./scene3d";
 import {
   DepthFog,
@@ -1171,7 +1172,7 @@ function CameraRig({ goal, anim, idleOk }: RigProps) {
     c.autoRotateSpeed = 0.35;
   });
 
-  return <OrbitControls ref={controls} makeDefault maxPolarAngle={Math.PI / 2.3} minDistance={6} maxDistance={220} />;
+  return <OrbitControls ref={controls} makeDefault {...NAV_CONTROL_PROPS} maxPolarAngle={Math.PI / 2.3} minDistance={6} maxDistance={220} />;
 }
 
 /** Tiled hospital floor under the whole scene. */
@@ -1379,6 +1380,9 @@ export default function BedScene({
     };
   }, [pickedKey]);
 
+  const nav = useNavHold();
+  useNavKeys(box, nav);
+
   const goal = useMemo<Goal>(() => {
     const key = `${view.kind}:${view.code}:${view.n}`;
     if (view.kind === "ward") {
@@ -1467,7 +1471,12 @@ export default function BedScene({
 
   return (
     <div className="space-y-2">
-      <div ref={box} className="relative h-[520px] overflow-hidden lg:h-[600px] rounded-md bg-brand-50">
+      <div
+        ref={box}
+        tabIndex={0}
+        aria-label="ภาพ 3 มิติ หอผู้ป่วย ใช้ลูกศรเพื่อเลื่อน"
+        className="relative h-[520px] overflow-hidden rounded-md bg-brand-50 outline-none focus-visible:ring-2 focus-visible:ring-brand-400 lg:h-[600px]"
+      >
         <Canvas
           key={quality}
           {...glProps}
@@ -1494,7 +1503,17 @@ export default function BedScene({
               onPickBed={(it) => void pickBed(it)}
             />
           </LabelPortal.Provider>
+          <NavDriver nav={nav} w={layout.width} d={layout.depth} />
         </Canvas>
+        <div className="absolute bottom-3 right-3 z-30">
+          <NavPad
+            nav={nav}
+            onReset={() => {
+              setPickedKey(null);
+              setView((v) => ({ kind: "overview", code: "", n: v.n + 1 }));
+            }}
+          />
+        </div>
         {picked ? (
           <div className="absolute bottom-3 left-3 z-30">
             <BedInfoPanel
