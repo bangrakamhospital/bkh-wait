@@ -64,7 +64,7 @@ else
   bash scripts/db-setup.sh
 fi
 
-echo "==> 4/8 build"
+echo "==> 5/8 build"
 npm ci --no-audit --no-fund
 npm run build
 node --env-file=.env scripts/db-migrate.mjs
