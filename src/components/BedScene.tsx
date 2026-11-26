@@ -33,6 +33,18 @@ const BED_SX = 0.8;
 const BED_SZ = 1.5;
 const MIN_ROOM_W = 6;
 const MIN_ROOM_D = 5;
+/** Walkway between every pair of bed columns, so nurses can reach any bed from an aisle. */
+const AISLE = 0.8;
+const BLANKET_A = new Color("#bfdbfe");
+const BLANKET_B = new Color("#e0f2fe");
+const MAX_NURSES = 15;
+
+const colOffset = (c: number) => c * BED_SX + Math.floor(c / 2) * AISLE;
+const blockW = (cols: number) => (cols === 0 ? 0 : cols * BED_SX + (Math.ceil(cols / 2) - 1) * AISLE);
+const hash01 = (n: number) => {
+  const x = Math.sin(n * 127.1 + 311.7) * 43758.5453;
+  return x - Math.floor(x);
+};
 
 const COLOR_FREE = "#22c55e";
 const COLOR_OCCUPIED = "#f59e0b";
@@ -152,7 +164,7 @@ function roomSize(n: number) {
   return {
     cols,
     rows,
-    w: Math.max(MIN_ROOM_W, cols * BED_SX + 1.4),
+    w: Math.max(MIN_ROOM_W, blockW(cols) + 1.4),
     d: Math.max(MIN_ROOM_D, rows * BED_SZ + 1.8),
   };
 }
@@ -242,24 +254,34 @@ function layoutScene(wards: WardOccupancy[], departments: DepartmentOccupancy[])
   return { rooms, zones, width, depth };
 }
 
+function bedXZ(room: RoomLayout, i: number) {
+  const col = i % room.cols;
+  const row = Math.floor(i / room.cols);
+  return {
+    col,
+    x: room.cx - blockW(room.cols) / 2 + colOffset(col) + BED_SX / 2,
+    z: room.cz - (room.rows * BED_SZ) / 2 + BED_SZ / 2 + 0.2 + row * BED_SZ,
+  };
+}
+
 function layoutBeds(rooms: RoomLayout[]): BedItem[] {
   const items: BedItem[] = [];
-  for (const { ward, idx, cx, cz, cols, rows } of rooms) {
+  for (const room of rooms) {
+    const { ward, idx } = room;
     const used = bedsInUse(ward);
     const n = Math.max(ward.beds, used);
     if (n === 0) continue;
-    const startX = cx - (cols * BED_SX) / 2 + BED_SX / 2;
-    const startZ = cz - (rows * BED_SZ) / 2 + BED_SZ / 2 + 0.2;
     const full = ward.occupancyPct >= 100;
     for (let i = 0; i < n; i++) {
       const kind: BedKind = i >= ward.beds ? "over" : i < used ? (full ? "full" : "occ") : "free";
+      const { x, z } = bedXZ(room, i);
       items.push({
         key: `${ward.wardCode}:${i}`,
         ward: ward.wardCode,
         wardIdx: idx,
         i,
-        x: startX + (i % cols) * BED_SX,
-        z: startZ + Math.floor(i / cols) * BED_SZ,
+        x,
+        z,
         kind,
         color:
           kind === "over" ? COLOR_OVER : kind === "full" ? COLOR_FULL : kind === "occ" ? COLOR_OCCUPIED : COLOR_FREE,
@@ -269,11 +291,19 @@ function layoutBeds(rooms: RoomLayout[]): BedItem[] {
   return items;
 }
 
-type BedState = { cur: Color; target: Color; birth: number; hop: number };
+type BedState = { cur: Color; target: Color; birth: number; hop: number; occ: boolean; pat: number };
+
+const meshProps = {
+  frustumCulled: false,
+  onUpdate: (m: InstancedMesh) => m.instanceMatrix.setUsage(DynamicDrawUsage),
+};
 
 function Beds({ items, anim }: { items: BedItem[]; anim: boolean }) {
   const mattress = useRef<InstancedMesh>(null);
   const head = useRef<InstancedMesh>(null);
+  const pillow = useRef<InstancedMesh>(null);
+  const pHead = useRef<InstancedMesh>(null);
+  const blanket = useRef<InstancedMesh>(null);
   const states = useRef(new Map<string, BedState>());
   const invalidate = useThree((s) => s.invalidate);
   const tmp = useMemo(() => ({ o: new Object3D(), c: new Color() }), []);
@@ -282,7 +312,10 @@ function Beds({ items, anim }: { items: BedItem[]; anim: boolean }) {
     (t: number, dt: number) => {
       const m = mattress.current;
       const h = head.current;
-      if (!m || !h) return;
+      const pl = pillow.current;
+      const ph = pHead.current;
+      const bl = blanket.current;
+      if (!m || !h || !pl || !ph || !bl) return;
       const { o, c } = tmp;
       const k = 1 - Math.exp(-8 * dt);
       items.forEach((it, i) => {
@@ -299,9 +332,11 @@ function Beds({ items, anim }: { items: BedItem[]; anim: boolean }) {
             if (p >= 1) st.hop = -1;
           }
           st.cur.lerp(st.target, k);
+          st.pat += ((st.occ ? 1 : 0) - st.pat) * k;
           lift = SHARED.lift[it.ward] ?? 0;
         } else {
           st.cur.copy(st.target);
+          st.pat = st.occ ? 1 : 0;
         }
         c.copy(st.cur);
         if (anim && (it.kind === "occ" || it.kind === "full")) {
@@ -309,18 +344,35 @@ function Beds({ items, anim }: { items: BedItem[]; anim: boolean }) {
           const wave = 0.5 + 0.5 * Math.sin(t * (full ? 4 : 1.6) + it.wardIdx * 0.7 + it.i * 0.35);
           c.lerp(full ? PULSE_FULL : PULSE_OCCUPIED, (full ? 0.4 : 0.18) * wave);
         }
+        const base = 0.5 + hop + lift;
         o.scale.setScalar(scale);
-        o.position.set(it.x, 0.5 + hop + lift, it.z);
+        o.position.set(it.x, base, it.z);
         o.updateMatrix();
         m.setMatrixAt(i, o.matrix);
         m.setColorAt(i, c);
-        o.position.set(it.x, 0.7 + hop + lift, it.z - 0.55);
+        o.position.set(it.x, base + 0.2, it.z - 0.55);
         o.updateMatrix();
         h.setMatrixAt(i, o.matrix);
+        o.position.set(it.x, base + 0.165, it.z - 0.38);
+        o.updateMatrix();
+        pl.setMatrixAt(i, o.matrix);
+        // Patient: head on the pillow + breathing blanket; scales in/out when the bed changes state.
+        const ps = scale * st.pat;
+        const hs = hash01(it.i + it.wardIdx * 131);
+        o.scale.setScalar(ps);
+        o.position.set(it.x, base + 0.31, it.z - 0.36);
+        o.updateMatrix();
+        ph.setMatrixAt(i, o.matrix);
+        const breathe = anim ? 1 + 0.1 * Math.sin(t * 1.8 + hs * 6.283) : 1;
+        o.scale.set(ps, ps * breathe, ps);
+        o.position.set(it.x, base + 0.125 + 0.07 * ps * breathe, it.z + 0.2);
+        o.updateMatrix();
+        bl.setMatrixAt(i, o.matrix);
+        bl.setColorAt(i, hs > 0.5 ? BLANKET_A : BLANKET_B);
       });
-      m.instanceMatrix.needsUpdate = true;
+      for (const mesh of [m, h, pl, ph, bl]) mesh.instanceMatrix.needsUpdate = true;
       if (m.instanceColor) m.instanceColor.needsUpdate = true;
-      h.instanceMatrix.needsUpdate = true;
+      if (bl.instanceColor) bl.instanceColor.needsUpdate = true;
     },
     [items, anim, tmp],
   );
@@ -335,18 +387,20 @@ function Beds({ items, anim }: { items: BedItem[]; anim: boolean }) {
     for (const it of items) {
       seen.add(it.key);
       next.set(it.color);
+      const occ = it.kind !== "free";
       const st = map.get(it.key);
       if (!st) {
         const birth = anim && first ? introTime(SHARED) + 0.5 + it.wardIdx * INTRO_STAGGER + it.i * 0.006 : t;
-        map.set(it.key, {
-          cur: next.clone(),
-          target: next.clone(),
-          birth,
-          hop: -1,
-        });
-      } else if (!next.equals(st.target)) {
-        st.target.copy(next);
-        if (anim) st.hop = t;
+        map.set(it.key, { cur: next.clone(), target: next.clone(), birth, hop: -1, occ, pat: occ ? 1 : 0 });
+      } else {
+        if (st.occ !== occ) {
+          st.occ = occ;
+          if (anim) st.hop = t;
+        }
+        if (!next.equals(st.target)) {
+          st.target.copy(next);
+          if (anim) st.hop = t;
+        }
       }
     }
     for (const key of map.keys()) if (!seen.has(key)) map.delete(key);
@@ -358,27 +412,241 @@ function Beds({ items, anim }: { items: BedItem[]; anim: boolean }) {
     if (anim) apply(now(), Math.min(dt, 0.1));
   });
 
+  const n = items.length;
   return (
     <>
-      <instancedMesh
-        key={`m${items.length}`}
-        ref={mattress}
-        args={[undefined, undefined, items.length]}
-        frustumCulled={false}
-        onUpdate={(m) => m.instanceMatrix.setUsage(DynamicDrawUsage)}
-      >
+      <instancedMesh key={`m${n}`} ref={mattress} args={[undefined, undefined, n]} {...meshProps}>
         <boxGeometry args={[0.6, 0.25, 1.1]} />
         <meshStandardMaterial />
       </instancedMesh>
-      <instancedMesh
-        key={`h${items.length}`}
-        ref={head}
-        args={[undefined, undefined, items.length]}
-        frustumCulled={false}
-        onUpdate={(m) => m.instanceMatrix.setUsage(DynamicDrawUsage)}
-      >
+      <instancedMesh key={`h${n}`} ref={head} args={[undefined, undefined, n]} {...meshProps}>
         <boxGeometry args={[0.6, 0.6, 0.1]} />
         <meshStandardMaterial color="#e2e8f0" />
+      </instancedMesh>
+      <instancedMesh key={`pl${n}`} ref={pillow} args={[undefined, undefined, n]} {...meshProps}>
+        <boxGeometry args={[0.4, 0.08, 0.22]} />
+        <meshStandardMaterial color="#ffffff" />
+      </instancedMesh>
+      <instancedMesh key={`ph${n}`} ref={pHead} args={[undefined, undefined, n]} {...meshProps}>
+        <sphereGeometry args={[0.13, 12, 8]} />
+        <meshStandardMaterial color="#f1c9a5" />
+      </instancedMesh>
+      <instancedMesh key={`bl${n}`} ref={blanket} args={[undefined, undefined, n]} {...meshProps}>
+        <boxGeometry args={[0.54, 0.14, 0.62]} />
+        <meshStandardMaterial />
+      </instancedMesh>
+    </>
+  );
+}
+
+type NurseSpec = { key: string; room: RoomLayout; n: number; occ: number[] };
+type NurseState = {
+  x: number;
+  z: number;
+  heading: number;
+  aisle: number;
+  wps: { x: number; z: number }[];
+  working: boolean;
+  until: number;
+  bed: number;
+  rng: () => number;
+};
+
+function seeded(key: string): () => number {
+  let a = 2166136261;
+  for (let i = 0; i < key.length; i++) a = Math.imul(a ^ key.charCodeAt(i), 16777619);
+  return () => {
+    a = (a + 0x6d2b79f5) | 0;
+    let t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+function aisleXs(room: RoomLayout): number[] {
+  const bw = blockW(room.cols);
+  const bx0 = room.cx - bw / 2;
+  const xs = [bx0 - 0.35];
+  for (let g = 1; g < Math.ceil(room.cols / 2); g++) xs.push(bx0 + g * (2 * BED_SX + AISLE) - AISLE / 2);
+  xs.push(bx0 + bw + 0.35);
+  return xs;
+}
+const bedAisle = (col: number) => (col % 2 === 0 ? col / 2 : (col - 1) / 2 + 1);
+
+function nurseSpecs(rooms: RoomLayout[]): NurseSpec[] {
+  const per = rooms.map((room) => {
+    const used = bedsInUse(room.ward);
+    return { room, used, count: used === 0 ? 0 : Math.min(3, Math.max(1, Math.ceil(used / 10))) };
+  });
+  let total = per.reduce((a, b) => a + b.count, 0);
+  while (total > MAX_NURSES) {
+    const big = per.reduce((a, b) => (b.count > a.count ? b : a));
+    big.count -= 1;
+    total -= 1;
+  }
+  const out: NurseSpec[] = [];
+  for (const { room, used, count } of per) {
+    const occ = Array.from({ length: used }, (_, i) => i);
+    for (let n = 0; n < count; n++) out.push({ key: `${room.ward.wardCode}:n${n}`, room, n, occ });
+  }
+  return out;
+}
+
+/** Plan the walk from the current aisle/z to the aisle beside a bed, via aisles and the top/bottom corridors. */
+function planRoute(ns: NurseState, room: RoomLayout, bed: number) {
+  const xs = aisleXs(room);
+  const { col, z } = bedXZ(room, bed);
+  const target = bedAisle(col);
+  const zTop = room.cz - (room.rows * BED_SZ) / 2 + 0.2 - 0.35;
+  const zBot = room.cz + (room.rows * BED_SZ) / 2 + 0.2 + 0.25;
+  ns.bed = bed;
+  ns.wps = [];
+  if (ns.aisle !== target) {
+    const zc = ns.z + z < zTop + zBot ? zTop : zBot;
+    ns.wps.push({ x: xs[ns.aisle], z: zc }, { x: xs[target], z: zc });
+  }
+  ns.wps.push({ x: xs[target], z });
+  ns.aisle = target;
+  ns.working = false;
+}
+
+function dampAngle(cur: number, target: number, lambda: number, dt: number): number {
+  const diff = ((((target - cur + Math.PI) % (2 * Math.PI)) + 2 * Math.PI) % (2 * Math.PI)) - Math.PI;
+  return cur + diff * (1 - Math.exp(-lambda * dt));
+}
+
+function Nurses({ rooms, anim }: { rooms: RoomLayout[]; anim: boolean }) {
+  const specs = useMemo(() => nurseSpecs(rooms), [rooms]);
+  const body = useRef<InstancedMesh>(null);
+  const head = useRef<InstancedMesh>(null);
+  const cap = useRef<InstancedMesh>(null);
+  const states = useRef(new Map<string, NurseState>());
+  const invalidate = useThree((s) => s.invalidate);
+  const parts = useMemo(() => {
+    const g = new Object3D();
+    const b = new Object3D();
+    const h = new Object3D();
+    const c = new Object3D();
+    b.position.set(0, 0.31, 0);
+    h.position.set(0, 0.7, 0);
+    c.position.set(0, 0.8, 0);
+    g.add(b, h, c);
+    return { g, b, h, c, col: new Color() };
+  }, []);
+
+  const update = useCallback(
+    (t: number, dt: number, advance: boolean) => {
+      const bm = body.current;
+      const hm = head.current;
+      const cm = cap.current;
+      if (!bm || !hm || !cm) return;
+      const { g, b, h, c, col } = parts;
+      specs.forEach((sp, i) => {
+        const ns = states.current.get(sp.key);
+        if (!ns) return;
+        const room = sp.room;
+        let walking = false;
+        if (advance) {
+          if (!ns.working) {
+            const wp = ns.wps[0];
+            if (wp) {
+              const dx = wp.x - ns.x;
+              const dz = wp.z - ns.z;
+              const dist = Math.hypot(dx, dz);
+              const step = 1.1 * dt;
+              if (dist <= step) {
+                ns.x = wp.x;
+                ns.z = wp.z;
+                ns.wps.shift();
+              } else {
+                ns.x += (dx / dist) * step;
+                ns.z += (dz / dist) * step;
+                ns.heading = dampAngle(ns.heading, Math.atan2(dx, dz), 10, dt);
+                walking = true;
+              }
+            }
+            if (ns.wps.length === 0) {
+              ns.working = true;
+              ns.until = t + 2 + ns.rng() * 2;
+            }
+          } else if (t > ns.until && sp.occ.length > 0) {
+            planRoute(ns, room, sp.occ[Math.floor(ns.rng() * sp.occ.length)]);
+          }
+          if (ns.working) {
+            const bed = bedXZ(room, Math.min(ns.bed, room.cols * room.rows - 1));
+            ns.heading = dampAngle(ns.heading, Math.atan2(bed.x - ns.x, bed.z - ns.z), 8, dt);
+          }
+        }
+        const appear = anim ? easeOutBack(clamp01((t - introTime(SHARED) - 1.6 - room.idx * INTRO_STAGGER) / 0.5)) : 1;
+        const phase = sp.n * 1.7 + room.idx;
+        const lean = anim && ns.working ? 0.28 * (0.5 + 0.5 * Math.sin(t * 2.5 + phase)) : 0;
+        const bob = walking ? Math.abs(Math.sin(t * 9 + phase)) * 0.05 : 0;
+        g.position.set(ns.x, 0.2 + (SHARED.lift[room.ward.wardCode] ?? 0) + bob, ns.z);
+        g.rotation.set(lean, ns.heading, 0, "YXZ");
+        g.scale.setScalar(Math.max(appear, 0.001));
+        g.updateMatrixWorld(true);
+        bm.setMatrixAt(i, b.matrixWorld);
+        bm.setColorAt(i, col.set(sp.n % 2 === 0 ? "#14b8a6" : "#f8fafc"));
+        hm.setMatrixAt(i, h.matrixWorld);
+        cm.setMatrixAt(i, c.matrixWorld);
+      });
+      bm.instanceMatrix.needsUpdate = true;
+      hm.instanceMatrix.needsUpdate = true;
+      cm.instanceMatrix.needsUpdate = true;
+      if (bm.instanceColor) bm.instanceColor.needsUpdate = true;
+    },
+    [specs, anim, parts],
+  );
+
+  useLayoutEffect(() => {
+    const map = states.current;
+    const seen = new Set<string>();
+    const t = now();
+    for (const sp of specs) {
+      seen.add(sp.key);
+      if (map.has(sp.key)) continue;
+      // Start standing in the aisle beside a (seeded) occupied bed, so the static pose is already sensible.
+      const rng = seeded(sp.key);
+      const bed = sp.occ[Math.floor(rng() * sp.occ.length)] ?? 0;
+      const { col, x: bx, z } = bedXZ(sp.room, bed);
+      const aisle = bedAisle(col);
+      const x = aisleXs(sp.room)[aisle];
+      map.set(sp.key, {
+        x,
+        z,
+        heading: Math.atan2(bx - x, 0),
+        aisle,
+        wps: [],
+        working: true,
+        until: t + rng() * 3,
+        bed,
+        rng,
+      });
+    }
+    for (const key of map.keys()) if (!seen.has(key)) map.delete(key);
+    update(t, 0.016, false);
+    invalidate();
+  }, [specs, update, invalidate]);
+
+  useFrame((_, dt) => {
+    if (anim) update(now(), Math.min(dt, 0.1), true);
+  });
+
+  const n = specs.length;
+  if (n === 0) return null;
+  return (
+    <>
+      <instancedMesh key={`nb${n}`} ref={body} args={[undefined, undefined, n]} {...meshProps}>
+        <capsuleGeometry args={[0.13, 0.36, 3, 8]} />
+        <meshStandardMaterial />
+      </instancedMesh>
+      <instancedMesh key={`nh${n}`} ref={head} args={[undefined, undefined, n]} {...meshProps}>
+        <sphereGeometry args={[0.11, 10, 8]} />
+        <meshStandardMaterial color="#f1c9a5" />
+      </instancedMesh>
+      <instancedMesh key={`nc${n}`} ref={cap} args={[undefined, undefined, n]} {...meshProps}>
+        <boxGeometry args={[0.2, 0.05, 0.2]} />
+        <meshStandardMaterial color="#ffffff" />
       </instancedMesh>
     </>
   );
@@ -678,6 +946,7 @@ function Scene({
         />
       ))}
       <Beds items={items} anim={anim} />
+      <Nurses rooms={layout.rooms} anim={anim} />
       <CameraRig goal={goal} anim={anim} idleOk={idleOk} />
     </>
   );
@@ -698,6 +967,12 @@ function Legend() {
       </span>
       <span className="inline-flex items-center gap-1">
         <span className={`${dot} bg-red-900`} /> เกินจำนวนเตียง
+      </span>
+      <span className="inline-flex items-center gap-1">
+        <span className={`${dot} rounded-full bg-orange-200 ring-1 ring-sky-300`} /> ผู้ป่วย
+      </span>
+      <span className="inline-flex items-center gap-1">
+        <span className={`${dot} rounded-full bg-teal-500`} /> พยาบาล
       </span>
     </div>
   );
