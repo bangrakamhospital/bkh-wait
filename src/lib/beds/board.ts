@@ -94,7 +94,7 @@ async function readSyncState(): Promise<SyncState> {
   return withPgTransaction(
     async (tx) => {
       const [last] = await tx.query<{ finished_at: string }>(
-        "SELECT finished_at FROM sync_run WHERE ok ORDER BY finished_at DESC LIMIT 1",
+        "SELECT finished_at FROM sync_run WHERE ok AND job = 'beds' ORDER BY finished_at DESC LIMIT 1",
       );
       if (!last) {
         throw new ApiError(503, "SYNC_NOT_READY", "ยังไม่มีข้อมูลเตียงจากการซิงก์ HOSxP");

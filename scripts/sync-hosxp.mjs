@@ -29,8 +29,6 @@
 // write (ward_config overrides are not applied: HOSxP capacities, ward 17
 // virtual by default).
 
-import pg from "pg";
-
 import {
   errCode,
   fetchActiveWards,
@@ -43,13 +41,11 @@ import {
   openHis,
   SyncError,
 } from "./lib/hosxp.mjs";
+import { openPg, pgCode } from "./lib/pg-sync.mjs";
 
 const LOCK_KEY = 72_517_085; // pg_advisory_xact_lock (migrate uses ...084)
 const DOMINANT_MAX_AGE_MS = 6 * 60 * 60 * 1000;
 const DEFAULT_VIRTUAL_WARDS = new Set(["17"]); // = ward_catalog view / config.ts
-const PG_OPTIONS =
-  "-c search_path=wait -c TimeZone=Asia/Bangkok -c statement_timeout=30000 " +
-  "-c lock_timeout=10000 -c idle_in_transaction_session_timeout=60000";
 
 const args = new Set(process.argv.slice(2));
 if (args.has("--help") || args.has("-h")) {
@@ -59,31 +55,6 @@ if (args.has("--help") || args.has("-h")) {
 const dryRun = args.has("--dry-run");
 
 const ts = () => new Date().toISOString();
-
-function pgCode(err) {
-  if (err instanceof SyncError) return err.code;
-  return `PG_${errCode(err)}`;
-}
-
-async function openPg() {
-  const url = process.env.WAIT_SYNC_DATABASE_URL?.trim();
-  if (!url) throw new SyncError("PG_NOT_CONFIGURED", "WAIT_SYNC_DATABASE_URL is not set");
-  const client = new pg.Client({
-    connectionString: url,
-    application_name: "bkh-wait-sync",
-    connectionTimeoutMillis: 10_000,
-    options: PG_OPTIONS,
-  });
-  // pg types: keep DATE as text
-  client.setTypeParser(pg.types.builtins.DATE, (v) => v);
-  try {
-    await client.connect();
-  } catch (err) {
-    throw new SyncError(`PG_${errCode(err)}`, "PostgreSQL connection failed");
-  }
-  client.on("error", () => {});
-  return client;
-}
 
 /** Everything read from HOSxP in one run. */
 async function readHis(his, { needDominant, openDays }) {
