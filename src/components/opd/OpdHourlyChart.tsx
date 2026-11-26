@@ -1,9 +1,11 @@
+"use client";
+
+import { useEffect, useRef, useState } from "react";
 import type { OpdHourPoint } from "@/lib/opd/types";
 import { fmtNum } from "../format";
 import { Card, EmptyState } from "../ui";
 
-const W = 720;
-const H = 240;
+const H = 224;
 const PAD = { l: 40, r: 44, t: 16, b: 28 };
 const TITLE = "ผู้ป่วยมาถึงและได้พบแพทย์รายชั่วโมง (วันนี้)";
 
@@ -15,6 +17,19 @@ const niceMax = (v: number) => {
 
 /** Hourly arrivals vs seen (bars) and average wait (line, right axis) for today. */
 export function OpdHourlyChart({ points }: { points: OpdHourPoint[] }) {
+  const wrap = useRef<HTMLDivElement>(null);
+  const [width, setWidth] = useState(720);
+  useEffect(() => {
+    const el = wrap.current;
+    if (!el) return;
+    const update = () => setWidth(Math.max(Math.floor(el.clientWidth), 360));
+    update();
+    if (typeof ResizeObserver === "undefined") return;
+    const ro = new ResizeObserver(update);
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, [points.length]);
+  const W = width;
   const active = points.filter((p) => p.arrived > 0 || p.seen > 0);
   if (active.length === 0) {
     return (
@@ -45,10 +60,11 @@ export function OpdHourlyChart({ points }: { points: OpdHourPoint[] }) {
 
   return (
     <Card title={TITLE}>
-      <div className="overflow-x-auto">
+      <div ref={wrap} className="w-full">
         <svg
-          viewBox={`0 0 ${W} ${H}`}
-          className="w-full min-w-[640px]"
+          width={W}
+          height={H}
+          className="block h-56"
           role="img"
           aria-label="กราฟแท่งผู้ป่วยมาถึงและได้พบแพทย์รายชั่วโมง พร้อมเส้นเวลารอเฉลี่ย"
         >

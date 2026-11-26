@@ -12,17 +12,21 @@ import { buttonGhostClass, toneBadge } from "../ui";
 import { OpdGrid2D } from "./OpdGrid2D";
 
 const COLS = 3;
-const CELL_W = 15;
-const CELL_D = 16;
-const ROOM_W = 11;
-const ROOM_D = 5.5;
-const SCREEN_D = 5.5;
+const CELL_W = 12.5;
+const ROOM_W = 7.5;
+const ROOM_D = 3.6;
+/** Strip behind every room's back wall reserved for the clinic label pill. */
+const LABEL_STRIP = 3.2;
+const SCREEN_D = 4;
 /** Patients drawn per clinic queue; the rest is shown as "+N" on the label. */
 const MAX_SHOWN = 30;
-const LANE_COLS = 3;
-const SLOT_DX = 0.78;
-const SLOT_DZ = 0.7;
+const LANE_COLS = 5;
+const LANE_ROWS = MAX_SHOWN / LANE_COLS;
+const SLOT_DX = 0.95;
+const SLOT_DZ = 0.85;
 const MOVE_SECONDS = 1.4;
+const CELL_D = LABEL_STRIP + ROOM_D + 0.6 + 0.7 + (LANE_ROWS - 1) * SLOT_DZ + 0.8;
+const ROOM_BACK = -CELL_D / 2 + LABEL_STRIP;
 
 const TONE_COLOR: Record<Tone, string> = {
   green: "#22c55e",
@@ -66,10 +70,13 @@ function layoutHall(clinics: ClinicWait[]): Hall {
 }
 
 /** Local (to the cell) position of queue slot j; slot 0 is right at the room door. */
-const doorZ = -CELL_D / 2 + ROOM_D + 0.9;
+const doorZ = ROOM_BACK + ROOM_D + 0.6;
+/** Snake order so that moving from slot j to j-1 is always one step. */
 function slotPos(j: number): [number, number] {
   const row = Math.floor(j / LANE_COLS);
-  return [((j % LANE_COLS) - (LANE_COLS - 1) / 2) * SLOT_DX, doorZ + 0.8 + row * SLOT_DZ];
+  const c = j % LANE_COLS;
+  const col = row % 2 === 0 ? c : LANE_COLS - 1 - c;
+  return [(col - (LANE_COLS - 1) / 2) * SLOT_DX, doorZ + 0.7 + row * SLOT_DZ];
 }
 
 type Queue = {
@@ -146,7 +153,7 @@ function PatientMeshes({ queues, total, anim }: { queues: Queue[]; total: number
         const hv = hash01(i + k + q.base * 0.37);
         const seated = hv < 0.3;
         const ys = seated ? 0.72 : 1;
-        const size = (0.9 + hv * 0.25) * sc;
+        const size = (1.3 + hv * 0.3) * sc;
         if (anim && q.moving) x += Math.sin(t * 1.3 + i * 1.7) * 0.03;
         dummy.rotation.set(0, 0, 0);
         dummy.position.set(x, 0.28 * ys * size, z);
@@ -249,19 +256,19 @@ function Desk({ x, z, w }: { x: number; z: number; w: number }) {
 function ClinicRoom({ cell, anim }: { cell: Cell; anim: boolean }) {
   const portal = useContext(LabelPortal) ?? undefined;
   const c = cell.clinic;
-  const roomZ = -CELL_D / 2 + ROOM_D / 2;
-  const deskZ = -CELL_D / 2 + 2.6;
+  const roomZ = ROOM_BACK + ROOM_D / 2;
+  const deskZ = ROOM_BACK + 1.6;
   const docs = Math.min(c.doctorsActive, 2);
   const over = Math.max(c.waitingNow - MAX_SHOWN, 0);
   const est = c.estimatedWaitMinutes;
   return (
     <group position={[cell.cx, 0, cell.cz]}>
       <mesh position={[0, 0.02, 0]}>
-        <boxGeometry args={[CELL_W - 1, 0.1, CELL_D - 1]} />
+        <boxGeometry args={[CELL_W - 0.6, 0.1, CELL_D - 0.6]} />
         <meshStandardMaterial color={FLOOR_COLOR[cell.tone]} />
       </mesh>
       {/* Examination room: back wall + low side walls, open to the queue. */}
-      <mesh position={[0, 1.1, -CELL_D / 2 + 0.2]}>
+      <mesh position={[0, 1.1, ROOM_BACK + 0.1]}>
         <boxGeometry args={[ROOM_W, 2.2, 0.2]} />
         <meshStandardMaterial color="#e2e8f0" />
       </mesh>
@@ -275,22 +282,26 @@ function ClinicRoom({ cell, anim }: { cell: Cell; anim: boolean }) {
         <boxGeometry args={[ROOM_W - 0.4, 0.04, ROOM_D - 0.2]} />
         <meshStandardMaterial color="#f1f5f9" />
       </mesh>
-      <Desk x={0} z={deskZ} w={3.2} />
+      <mesh position={[0, 0.08, doorZ + 0.7 + ((LANE_ROWS - 1) * SLOT_DZ) / 2]}>
+        <boxGeometry args={[LANE_COLS * SLOT_DX + 0.8, 0.03, LANE_ROWS * SLOT_DZ + 0.6]} />
+        <meshStandardMaterial color="#f8fafc" />
+      </mesh>
+      <Desk x={0} z={deskZ} w={3} />
       {docs === 0 ? null : docs === 1 ? (
-        <Person x={0} z={deskZ - 0.9} coat="#f8fafc" active anim={anim} seed={cell.cx + cell.cz} />
+        <Person x={0} z={deskZ - 0.8} coat="#f8fafc" active anim={anim} seed={cell.cx + cell.cz} />
       ) : (
         <>
-          <Person x={-0.9} z={deskZ - 0.9} coat="#f8fafc" active anim={anim} seed={cell.cx} />
-          <Person x={0.9} z={deskZ - 0.9} coat="#f8fafc" active anim={anim} seed={cell.cz + 2} />
+          <Person x={-0.9} z={deskZ - 0.8} coat="#f8fafc" active anim={anim} seed={cell.cx} />
+          <Person x={0.9} z={deskZ - 0.8} coat="#f8fafc" active anim={anim} seed={cell.cz + 2} />
         </>
       )}
-      <mesh position={[0, 0.4, deskZ + 1.4]}>
+      <mesh position={[0, 0.4, deskZ + 1.2]}>
         <boxGeometry args={[0.6, 0.8, 0.6]} />
         <meshStandardMaterial color="#64748b" />
       </mesh>
       {/* Clinic pill: screen-aligned, never rotates. Always portal into the canvas box. */}
-      <Html portal={portal} position={[0, 0.2, CELL_D / 2 - 0.3]} center zIndexRange={[5, 0]} pointerEvents="none">
-        <div className="translate-y-3 whitespace-nowrap rounded-md bg-white/95 px-2 py-1 text-center text-xs shadow">
+      <Html portal={portal} position={[0, 2.6, ROOM_BACK - 0.5]} center zIndexRange={[5, 0]} pointerEvents="none">
+        <div className="whitespace-nowrap rounded-md bg-white/95 px-2 py-1 text-center text-xs shadow">
           <div className="font-semibold">{c.clinicName}</div>
           <div className="mt-0.5 flex items-center justify-center gap-1">
             <span>
@@ -316,11 +327,11 @@ function ScreeningDesk({ hall, anim }: { hall: Hall; anim: boolean }) {
         <boxGeometry args={[hall.width - 1, 0.1, SCREEN_D - 1]} />
         <meshStandardMaterial color="#99d5cd" />
       </mesh>
-      <Desk x={0} z={-0.3} w={Math.min(hall.width * 0.5, 14)} />
+      <Desk x={0} z={0.2} w={Math.min(hall.width * 0.5, 12)} />
       {[-3, 0, 3].map((x, i) => (
-        <Person key={x} x={x} z={-1.2} coat="#0f766e" active anim={anim} seed={i * 1.9} />
+        <Person key={x} x={x} z={-0.7} coat="#0f766e" active anim={anim} seed={i * 1.9} />
       ))}
-      <Html portal={portal} position={[0, 0.2, SCREEN_D / 2 - 0.6]} center zIndexRange={[5, 0]} pointerEvents="none">
+      <Html portal={portal} position={[0, 0.2, SCREEN_D / 2 - 0.4]} center zIndexRange={[5, 0]} pointerEvents="none">
         <div className="whitespace-nowrap rounded-md bg-brand-700 px-3 py-0.5 text-xs font-semibold text-white shadow">
           จุดคัดกรอง (พยาบาล)
         </div>
@@ -403,7 +414,7 @@ export default function OpdScene({ clinics }: { clinics: ClinicWait[] }) {
   const box = useRef<HTMLDivElement>(null);
   const hall = useMemo(() => layoutHall(clinics), [clinics]);
   const goal = useMemo<Goal>(
-    () => ({ key: `${hall.width}x${hall.depth}`, cx: 0, cz: hall.depth * 0.04, w: hall.width, d: hall.depth, margin: 2.5 }),
+    () => ({ key: `${hall.width}x${hall.depth}`, cx: 0, cz: hall.depth * 0.07, w: hall.width, d: hall.depth * 0.95, margin: 1 }),
     [hall.width, hall.depth],
   );
 
@@ -427,7 +438,7 @@ export default function OpdScene({ clinics }: { clinics: ClinicWait[] }) {
 
   return (
     <div className="space-y-2">
-      <div ref={box} className="relative h-[520px] overflow-hidden rounded-md bg-brand-50 lg:h-[600px]">
+      <div ref={box} className="relative h-[520px] overflow-hidden rounded-md bg-brand-50 lg:h-[680px]">
         <Canvas
           frameloop={anim && visible ? "always" : "demand"}
           dpr={[1, 1.5]}
