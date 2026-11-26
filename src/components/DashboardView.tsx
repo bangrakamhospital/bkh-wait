@@ -61,7 +61,7 @@ export function DashboardView({ board }: { board: BedBoard }) {
       <DepartmentTable rows={shownRows} total={totals} filtered={dept !== null} />
 
       <Card title="ผังเตียงแบบ 3 มิติ">
-        <BedSceneLoader key={filter} wards={shownWards} departments={board.departments} />
+        <BedSceneLoader wards={realWards} departments={board.departments} focusDept={filter} />
       </Card>
 
       <h2 className="text-base font-semibold">สรุปรายแผนก</h2>

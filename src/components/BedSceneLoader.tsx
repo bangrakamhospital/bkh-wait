@@ -16,9 +16,12 @@ const BedScene = dynamic(() => import("./BedScene"), {
 export function BedSceneLoader({
   wards,
   departments,
+  focusDept,
 }: {
   wards: WardOccupancy[];
   departments: DepartmentOccupancy[];
+  /** Department code to fly the camera to ("" = overview). */
+  focusDept: string;
 }) {
-  return <BedScene wards={wards} departments={departments} />;
+  return <BedScene wards={wards} departments={departments} focusDept={focusDept} />;
 }
