@@ -16,7 +16,7 @@
 --                   schema_migrations is SELECT-only (db/002 revokes writes);
 --                   the HOSxP copies (his_ward, ward_state, daily_census,
 --                   sync_run, occupancy_snapshot, ...) are SELECT-only
---                   (db/003 revokes writes).
+--                   (db/003 + db/004 revoke writes).
 --   bkh_wait_sync   the HOSxP sync worker (scripts/sync-hosxp.mjs): created
 --                   by db/sync-role.sql via scripts/db-sync-role.sh (called
 --                   by db-setup.sh after this file, before the migrations);

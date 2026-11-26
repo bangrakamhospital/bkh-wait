@@ -138,10 +138,10 @@ SELECT h.ward_code,
 -- Privileges (least privilege).
 --   bkh_wait_sync (worker): read config, write the sync tables + snapshots.
 --     No access to refer_back_request, audit_log or users of the web app.
---   bkh_wait_app (web): read the sync tables; occupancy_snapshot becomes
---     read-only (the worker writes it now).
+--   bkh_wait_app (web): read the sync tables (occupancy_snapshot becomes
+--     read-only in db/004, after the upgrade switched the cron).
 -- The owner role has no CREATEROLE (db/setup.sql), so on a normal install
--- bkh_wait_sync is created by db/setup.sql. If it is missing and the
+-- bkh_wait_sync is created by db/sync-role.sql. If it is missing and the
 -- migrating role may create roles (superuser on a dev box), it is created
 -- here WITHOUT login; give it one with
 --   ALTER ROLE bkh_wait_sync LOGIN PASSWORD '...';
@@ -158,7 +158,7 @@ BEGIN
         CONNECTION LIMIT 3;
       RAISE NOTICE 'created role bkh_wait_sync without login: ALTER ROLE bkh_wait_sync LOGIN PASSWORD ...';
     ELSE
-      RAISE WARNING 'role bkh_wait_sync does not exist and % cannot create roles: create it as postgres (see db/setup.sql), then re-run the GRANTs of db/003_hosxp_sync.sql', current_user;
+      RAISE WARNING 'role bkh_wait_sync does not exist and % cannot create roles: create it as postgres (scripts/db-sync-role.sh), then re-run the GRANTs of db/003_hosxp_sync.sql', current_user;
     END IF;
   END IF;
 
@@ -176,9 +176,11 @@ BEGIN
 
   IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'bkh_wait_app') THEN
     -- default privileges (db/setup.sql) granted read-write; the app only reads these.
+    -- occupancy_snapshot is made read-only for the app by db/004 (applied by
+    -- scripts/server-upgrade-sync.sh only after the first sync worked and
+    -- the old snapshot cron is gone, so a failed upgrade never stops it).
     REVOKE INSERT, UPDATE, DELETE, TRUNCATE
-      ON his_ward, his_spclty, sync_run, ward_state, ward_spclty_state, daily_census, ward_catalog,
-         occupancy_snapshot
+      ON his_ward, his_spclty, sync_run, ward_state, ward_spclty_state, daily_census, ward_catalog
       FROM bkh_wait_app;
     GRANT SELECT
       ON his_ward, his_spclty, sync_run, ward_state, ward_spclty_state, daily_census, ward_catalog,

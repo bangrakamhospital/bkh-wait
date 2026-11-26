@@ -3,6 +3,8 @@
 //
 //   npm run db:migrate               apply pending migrations
 //   npm run db:migrate -- --status   list applied / pending, change nothing
+//   npm run db:migrate -- --to 003   apply pending migrations up to 003 only
+//                                    (used by scripts/server-upgrade-sync.sh)
 //
 // Connection (first one set wins):
 //   WAIT_MIGRATE_DATABASE_URL   owner account (DDL), recommended
@@ -60,6 +62,12 @@ async function listFiles() {
 
 async function main() {
   const statusOnly = process.argv.includes("--status");
+  const toIdx = process.argv.indexOf("--to");
+  const upTo = toIdx >= 0 ? process.argv[toIdx + 1] : null;
+  if (toIdx >= 0 && !/^\d{3}$/.test(upTo ?? "")) {
+    console.error("db-migrate: --to needs a 3-digit migration number, e.g. --to 003");
+    process.exit(2);
+  }
   const url = connectionString();
   if (!url) {
     console.error(
@@ -101,7 +109,9 @@ async function main() {
       }
     }
 
-    const pending = files.filter((f) => !applied.has(f.version));
+    const pending = files.filter(
+      (f) => !applied.has(f.version) && (upTo === null || f.version <= upTo),
+    );
     if (statusOnly) {
       for (const f of files) {
         const a = applied.get(f.version);

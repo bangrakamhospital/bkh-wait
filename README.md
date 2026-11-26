@@ -92,9 +92,11 @@ Path `/var/www/wait`, deploy only `main`. pm2 process `bkh-wait` on
 - New server: `scripts/server-first-deploy.sh` (see its header).
 - Existing install from before the sync worker (HIS_* in `.env`, cron
   `snapshot.mjs`): `bash scripts/server-upgrade-sync.sh` once — moves HIS_*
-  to `.env.sync`, creates role `bkh_wait_sync`, runs migration 003, the
-  first sync, swaps the cron line, rebuilds and restarts. Existing history
-  is kept.
+  to `.env.sync`, creates role `bkh_wait_sync`, checks HOSxP (dry run),
+  runs migration 003, the first sync, rebuilds, swaps the cron line,
+  restarts, then migration 004 (snapshots read-only for the app). A failure
+  before the switch leaves the old app and its cron working; fix and
+  re-run. Existing history is kept.
 
 Later deploys:
 
