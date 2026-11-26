@@ -14,13 +14,25 @@ export const hash01 = (n: number) => {
 export const now = () => performance.now() / 1000;
 export const clamp01 = (v: number) => Math.min(1, Math.max(0, v));
 
+let webglSupport: boolean | null = null;
+
+/**
+ * WebGL available? Probed once per page and cached: this is a
+ * useSyncExternalStore snapshot (read on every render), and each probe would
+ * otherwise create a new WebGL context until the browser starts dropping the
+ * scene’s own context ("Too many active WebGL contexts").
+ */
 export function detectWebGL(): boolean {
+  if (webglSupport !== null) return webglSupport;
   try {
     const canvas = document.createElement("canvas");
-    return Boolean(canvas.getContext("webgl2") ?? canvas.getContext("webgl"));
+    const gl = canvas.getContext("webgl2") ?? canvas.getContext("webgl");
+    webglSupport = Boolean(gl);
+    gl?.getExtension("WEBGL_lose_context")?.loseContext();
   } catch {
-    return false;
+    webglSupport = false;
   }
+  return webglSupport;
 }
 
 /** Animation preference: stored choice, else the OS reduced-motion setting. */

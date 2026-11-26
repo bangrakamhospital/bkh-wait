@@ -8,6 +8,18 @@ import type { Group, InstancedMesh, PerspectiveCamera } from "three";
 import type { ClinicWait } from "@/lib/opd/types";
 import { fmtNum, waitTone, type Tone } from "../format";
 import { LabelPortal, clamp01, detectWebGL, goalPose, hash01, now, readAnimPref, writeAnimPref, type Goal } from "../scene3d";
+import {
+  DepthFog,
+  QualityToggle,
+  RoomEnv,
+  SceneLights,
+  canvasProps,
+  edgeShadeTexture,
+  readQuality,
+  roundedBox,
+  tileTexture,
+  type Quality,
+} from "../scene3dLook";
 import { buttonGhostClass, toneBadge } from "../ui";
 import { OpdGrid2D } from "./OpdGrid2D";
 
@@ -27,6 +39,10 @@ const SLOT_DZ = 0.85;
 const MOVE_SECONDS = 1.4;
 const CELL_D = LABEL_STRIP + ROOM_D + 0.6 + 0.7 + (LANE_ROWS - 1) * SLOT_DZ + 0.8;
 const ROOM_BACK = -CELL_D / 2 + LABEL_STRIP;
+const BG_COLOR = "#effaf8";
+/** Bench seat behind each queue row; seated patients sit on it. */
+const BENCH_DZ = 0.3;
+const SEAT_H = 0.42;
 
 const TONE_COLOR: Record<Tone, string> = {
   green: "#22c55e",
@@ -37,10 +53,10 @@ const TONE_COLOR: Record<Tone, string> = {
   brand: "#14b8a6",
 };
 const FLOOR_COLOR: Record<Tone, string> = {
-  green: "#bbf7d0",
-  amber: "#fde68a",
-  orange: "#fed7aa",
-  red: "#fecaca",
+  green: "#b4ecc6",
+  amber: "#fbe08a",
+  orange: "#fdcf9e",
+  red: "#f9bcbc",
   slate: "#e2e8f0",
   brand: "#d5f2ed",
 };
@@ -145,22 +161,26 @@ function PatientMeshes({ queues, total, anim }: { queues: Queue[]; total: number
         const [ax, az] = slotPos(i);
         const [bx, bz] = i === 0 ? [0, doorZ - 1.4] : slotPos(i - 1);
         let x = q.cell.cx + ax + (bx - ax) * e;
-        const z = q.cell.cz + az + (bz - az) * e;
+        let z = q.cell.cz + az + (bz - az) * e;
         // Walker leaves at the head, newcomer arrives at the tail.
         let sc = 1;
         if (i === 0) sc = 1 - e;
         else if (i === n) sc = e;
         const hv = hash01(i + k + q.base * 0.37);
-        const seated = hv < 0.3;
-        const ys = seated ? 0.72 : 1;
-        const size = (1.3 + hv * 0.3) * sc;
+        // Some sit on the bench behind their spot (not while stepping forward).
+        const seated = hv < 0.35 && !moving && i > 0;
+        const size = (1.4 + hv * 0.3) * sc;
+        if (seated) z += BENCH_DZ - 0.08;
         if (anim && q.moving) x += Math.sin(t * 1.3 + i * 1.7) * 0.03;
-        dummy.rotation.set(0, 0, 0);
-        dummy.position.set(x, 0.28 * ys * size, z);
+        const bodyH = 0.6 * size;
+        const y0 = seated ? SEAT_H : 0;
+        const ys = seated ? 0.7 : 1;
+        dummy.rotation.set(0, Math.PI, 0);
+        dummy.position.set(x, y0 + (bodyH * ys) / 2, z);
         dummy.scale.set(size, ys * size, size);
         dummy.updateMatrix();
         b.setMatrixAt(idx, dummy.matrix);
-        dummy.position.set(x, (0.58 * ys + 0.16) * size, z);
+        dummy.position.set(x, y0 + bodyH * ys + 0.12 * size, z);
         dummy.scale.set(size, size, size);
         dummy.updateMatrix();
         h.setMatrixAt(idx, dummy.matrix);
@@ -188,10 +208,11 @@ function PatientMeshes({ queues, total, anim }: { queues: Queue[]; total: number
           if (m) m.instanceMatrix.setUsage(DynamicDrawUsage);
         }}
         args={[undefined, undefined, total]}
+        castShadow
         {...meshProps}
       >
-        <cylinderGeometry args={[0.2, 0.24, 0.56, 8]} />
-        <meshStandardMaterial />
+        <capsuleGeometry args={[0.17, 0.26, 4, 10]} />
+        <meshStandardMaterial roughness={0.7} />
       </instancedMesh>
       <instancedMesh
         key={`ph${total}`}
@@ -200,16 +221,74 @@ function PatientMeshes({ queues, total, anim }: { queues: Queue[]; total: number
           if (m) m.instanceMatrix.setUsage(DynamicDrawUsage);
         }}
         args={[undefined, undefined, total]}
+        castShadow
         {...meshProps}
       >
-        <sphereGeometry args={[0.15, 8, 6]} />
-        <meshStandardMaterial color="#d9a47a" />
+        <sphereGeometry args={[0.12, 14, 10]} />
+        <meshStandardMaterial color="#d9a47a" roughness={0.7} />
       </instancedMesh>
     </>
   );
 }
 
-/** A standing staff member (doctor / nurse) behind a desk; bobs and "writes" when active. */
+/** Waiting benches (seat + backrest + legs) behind every queue row of every clinic, all instanced. */
+function Benches({ hall }: { hall: Hall }) {
+  const seat = useRef<InstancedMesh>(null);
+  const back = useRef<InstancedMesh>(null);
+  const legs = useRef<InstancedMesh>(null);
+  const invalidate = useThree((s) => s.invalidate);
+  const geo = useMemo(
+    () => ({ seat: roundedBox(LANE_COLS * SLOT_DX, 0.06, 0.4, 0.025), back: roundedBox(LANE_COLS * SLOT_DX, 0.34, 0.05, 0.022) }),
+    [],
+  );
+  const n = hall.cells.length * LANE_ROWS;
+  useLayoutEffect(() => {
+    const s = seat.current;
+    const b = back.current;
+    const l = legs.current;
+    if (!s || !b || !l) return;
+    let i = 0;
+    for (const cell of hall.cells) {
+      for (let r = 0; r < LANE_ROWS; r++) {
+        const z = cell.cz + slotPos(r * LANE_COLS)[1] + BENCH_DZ;
+        dummy.rotation.set(0, 0, 0);
+        dummy.scale.set(1, 1, 1);
+        dummy.position.set(cell.cx, SEAT_H - 0.03, z);
+        dummy.updateMatrix();
+        s.setMatrixAt(i, dummy.matrix);
+        dummy.position.set(cell.cx, SEAT_H + 0.17, z + 0.2);
+        dummy.updateMatrix();
+        b.setMatrixAt(i, dummy.matrix);
+        [-1, 1].forEach((side, k) => {
+          dummy.position.set(cell.cx + side * (LANE_COLS * SLOT_DX * 0.5 - 0.15), (SEAT_H - 0.06) / 2, z);
+          dummy.scale.set(0.05, SEAT_H - 0.06, 0.36);
+          dummy.updateMatrix();
+          l.setMatrixAt(i * 2 + k, dummy.matrix);
+        });
+        i++;
+      }
+    }
+    for (const m of [s, b, l]) m.instanceMatrix.needsUpdate = true;
+    invalidate();
+  }, [hall, invalidate]);
+  if (n === 0) return null;
+  return (
+    <>
+      <instancedMesh key={`bs${n}`} ref={seat} args={[geo.seat, undefined, n]} castShadow receiveShadow frustumCulled={false}>
+        <meshStandardMaterial color="#3b82a0" roughness={0.45} metalness={0.1} />
+      </instancedMesh>
+      <instancedMesh key={`bb${n}`} ref={back} args={[geo.back, undefined, n]} castShadow frustumCulled={false}>
+        <meshStandardMaterial color="#3b82a0" roughness={0.45} metalness={0.1} />
+      </instancedMesh>
+      <instancedMesh key={`bl${n}`} ref={legs} args={[undefined, undefined, n * 2]} frustumCulled={false}>
+        <boxGeometry />
+        <meshStandardMaterial color="#94a3b8" metalness={0.6} roughness={0.35} />
+      </instancedMesh>
+    </>
+  );
+}
+
+/** A seated staff member (doctor / nurse) behind a desk facing +z; "writes" when active. */
 function Person({ x, z, coat, active, seed, anim }: { x: number; z: number; coat: string; active: boolean; seed: number; anim: boolean }) {
   const root = useRef<Group>(null);
   const arm = useRef<Group>(null);
@@ -217,39 +296,103 @@ function Person({ x, z, coat, active, seed, anim }: { x: number; z: number; coat
     if (!root.current || !arm.current) return;
     if (anim && active) {
       const t = now() + seed;
-      root.current.position.y = Math.abs(Math.sin(t * 2.2)) * 0.03;
-      arm.current.rotation.x = -0.9 + Math.sin(t * 5) * 0.25;
+      root.current.rotation.x = 0.06 + Math.sin(t * 1.4) * 0.04;
+      arm.current.rotation.x = -1.1 + Math.sin(t * 5) * 0.22;
     } else {
-      root.current.position.y = 0;
-      arm.current.rotation.x = -0.4;
+      root.current.rotation.x = 0.06;
+      arm.current.rotation.x = -0.9;
     }
   });
   return (
-    <group ref={root} position={[x, 0, z]}>
-      <mesh position={[0, 0.5, 0]}>
-        <cylinderGeometry args={[0.24, 0.3, 0.9, 8]} />
-        <meshStandardMaterial color={coat} />
+    <group position={[x, 0, z]}>
+      {/* Office chair */}
+      <mesh position={[0, 0.42, -0.05]} castShadow>
+        <cylinderGeometry args={[0.24, 0.24, 0.07, 16]} />
+        <meshStandardMaterial color="#334155" roughness={0.6} />
       </mesh>
-      <mesh position={[0, 1.15, 0]}>
-        <sphereGeometry args={[0.2, 8, 6]} />
-        <meshStandardMaterial color="#d9a47a" />
+      <mesh position={[0, 0.21, -0.05]}>
+        <cylinderGeometry args={[0.03, 0.03, 0.4, 8]} />
+        <meshStandardMaterial color="#64748b" metalness={0.6} roughness={0.35} />
       </mesh>
-      <group ref={arm} position={[0.28, 0.85, 0]}>
-        <mesh position={[0, -0.05, 0.25]}>
-          <boxGeometry args={[0.1, 0.1, 0.5]} />
-          <meshStandardMaterial color={coat} />
+      <mesh position={[0, 0.72, -0.3]} castShadow>
+        <boxGeometry args={[0.42, 0.5, 0.06]} />
+        <meshStandardMaterial color="#334155" roughness={0.6} />
+      </mesh>
+      <group ref={root} position={[0, 0.46, 0]}>
+        <mesh position={[0, 0.3, 0]} castShadow>
+          <capsuleGeometry args={[0.2, 0.3, 4, 12]} />
+          <meshStandardMaterial color={coat} roughness={0.7} />
         </mesh>
+        <mesh position={[0, 0.74, 0.02]} castShadow>
+          <sphereGeometry args={[0.16, 16, 12]} />
+          <meshStandardMaterial color="#d9a47a" roughness={0.7} />
+        </mesh>
+        <group ref={arm} position={[0.22, 0.42, 0.04]}>
+          <mesh position={[0, 0, 0.18]}>
+            <capsuleGeometry args={[0.055, 0.28, 3, 8]} />
+            <meshStandardMaterial color={coat} roughness={0.7} />
+          </mesh>
+        </group>
       </group>
     </group>
   );
 }
 
-function Desk({ x, z, w }: { x: number; z: number; w: number }) {
+/** Desk with a rounded top, modesty panel, and one monitor per seat (facing the staff). */
+function Desk({ x, z, w, seats }: { x: number; z: number; w: number; seats: number[] }) {
+  const top = useMemo(() => roundedBox(w, 0.06, 0.8, 0.03), [w]);
   return (
-    <mesh position={[x, 0.4, z]}>
-      <boxGeometry args={[w, 0.8, 0.9]} />
-      <meshStandardMaterial color="#a16207" />
-    </mesh>
+    <group position={[x, 0, z]}>
+      <mesh position={[0, 0.76, 0]} geometry={top} castShadow receiveShadow>
+        <meshStandardMaterial color="#d6b48a" roughness={0.55} />
+      </mesh>
+      <mesh position={[0, 0.38, 0.34]} castShadow>
+        <boxGeometry args={[w - 0.1, 0.7, 0.04]} />
+        <meshStandardMaterial color="#f1f5f9" roughness={0.7} />
+      </mesh>
+      {[-1, 1].map((s) => (
+        <mesh key={s} position={[s * (w / 2 - 0.05), 0.38, 0]} castShadow>
+          <boxGeometry args={[0.05, 0.74, 0.74]} />
+          <meshStandardMaterial color="#f1f5f9" roughness={0.7} />
+        </mesh>
+      ))}
+      {seats.map((sx) => (
+        <group key={sx} position={[sx, 0.79, 0.12]}>
+          <mesh position={[0, 0.2, 0]} castShadow>
+            <boxGeometry args={[0.5, 0.32, 0.03]} />
+            <meshStandardMaterial color="#0f172a" roughness={0.25} metalness={0.3} />
+          </mesh>
+          <mesh position={[0, 0.2, -0.017]} rotation={[0, Math.PI, 0]}>
+            <planeGeometry args={[0.46, 0.28]} />
+            <meshStandardMaterial color="#60a5fa" emissive="#3b82f6" emissiveIntensity={0.5} roughness={0.2} />
+          </mesh>
+          <mesh position={[0, 0.03, 0.03]}>
+            <boxGeometry args={[0.16, 0.06, 0.12]} />
+            <meshStandardMaterial color="#334155" />
+          </mesh>
+        </group>
+      ))}
+    </group>
+  );
+}
+
+/** Patient chair in front of a consultation desk. */
+function Chair({ x, z }: { x: number; z: number }) {
+  return (
+    <group position={[x, 0, z]}>
+      <mesh position={[0, 0.44, 0]} castShadow>
+        <boxGeometry args={[0.44, 0.06, 0.42]} />
+        <meshStandardMaterial color="#3b82a0" roughness={0.45} />
+      </mesh>
+      <mesh position={[0, 0.68, 0.2]} castShadow>
+        <boxGeometry args={[0.44, 0.42, 0.05]} />
+        <meshStandardMaterial color="#3b82a0" roughness={0.45} />
+      </mesh>
+      <mesh position={[0, 0.21, 0]}>
+        <cylinderGeometry args={[0.03, 0.03, 0.42, 8]} />
+        <meshStandardMaterial color="#94a3b8" metalness={0.5} roughness={0.4} />
+      </mesh>
+    </group>
   );
 }
 
@@ -261,44 +404,43 @@ function ClinicRoom({ cell, anim }: { cell: Cell; anim: boolean }) {
   const docs = Math.min(c.doctorsActive, 2);
   const over = Math.max(c.waitingNow - MAX_SHOWN, 0);
   const est = c.estimatedWaitMinutes;
+  const seatXs = docs === 2 ? [-0.9, 0.9] : [0];
   return (
     <group position={[cell.cx, 0, cell.cz]}>
-      <mesh position={[0, 0.02, 0]}>
+      <mesh position={[0, 0.02, 0]} receiveShadow>
         <boxGeometry args={[CELL_W - 0.6, 0.1, CELL_D - 0.6]} />
-        <meshStandardMaterial color={FLOOR_COLOR[cell.tone]} />
+        <meshStandardMaterial color={FLOOR_COLOR[cell.tone]} map={edgeShadeTexture()} roughness={0.8} />
       </mesh>
       {/* Examination room: back wall + low side walls, open to the queue. */}
-      <mesh position={[0, 1.1, ROOM_BACK + 0.1]}>
+      <mesh position={[0, 1.1, ROOM_BACK + 0.1]} castShadow receiveShadow>
         <boxGeometry args={[ROOM_W, 2.2, 0.2]} />
-        <meshStandardMaterial color="#e2e8f0" />
+        <meshStandardMaterial color="#f8fafc" roughness={0.85} />
+      </mesh>
+      <mesh position={[0, 2.22, ROOM_BACK + 0.1]}>
+        <boxGeometry args={[ROOM_W + 0.02, 0.06, 0.24]} />
+        <meshStandardMaterial color="#5eb3a8" roughness={0.6} />
       </mesh>
       {[-1, 1].map((s) => (
-        <mesh key={s} position={[s * (ROOM_W / 2 - 0.1), 0.5, roomZ]}>
+        <mesh key={s} position={[s * (ROOM_W / 2 - 0.1), 0.5, roomZ]} castShadow receiveShadow>
           <boxGeometry args={[0.2, 1, ROOM_D]} />
-          <meshStandardMaterial color="#cbd5e1" />
+          <meshStandardMaterial color="#eef2f6" roughness={0.85} />
         </mesh>
       ))}
-      <mesh position={[0, 0.09, roomZ]}>
+      <mesh position={[0, 0.09, roomZ]} receiveShadow>
         <boxGeometry args={[ROOM_W - 0.4, 0.04, ROOM_D - 0.2]} />
-        <meshStandardMaterial color="#f1f5f9" />
+        <meshStandardMaterial color="#f5f7f9" map={edgeShadeTexture()} roughness={0.6} />
       </mesh>
-      <mesh position={[0, 0.08, doorZ + 0.7 + ((LANE_ROWS - 1) * SLOT_DZ) / 2]}>
+      <mesh position={[0, 0.08, doorZ + 0.7 + ((LANE_ROWS - 1) * SLOT_DZ) / 2]} receiveShadow>
         <boxGeometry args={[LANE_COLS * SLOT_DX + 0.8, 0.03, LANE_ROWS * SLOT_DZ + 0.6]} />
-        <meshStandardMaterial color="#f8fafc" />
+        <meshStandardMaterial color="#f8fafc" roughness={0.7} />
       </mesh>
-      <Desk x={0} z={deskZ} w={3} />
-      {docs === 0 ? null : docs === 1 ? (
-        <Person x={0} z={deskZ - 0.8} coat="#f8fafc" active anim={anim} seed={cell.cx + cell.cz} />
-      ) : (
-        <>
-          <Person x={-0.9} z={deskZ - 0.8} coat="#f8fafc" active anim={anim} seed={cell.cx} />
-          <Person x={0.9} z={deskZ - 0.8} coat="#f8fafc" active anim={anim} seed={cell.cz + 2} />
-        </>
-      )}
-      <mesh position={[0, 0.4, deskZ + 1.2]}>
-        <boxGeometry args={[0.6, 0.8, 0.6]} />
-        <meshStandardMaterial color="#64748b" />
-      </mesh>
+      <Desk x={0} z={deskZ} w={3} seats={docs === 0 ? [0] : seatXs} />
+      {docs === 0
+        ? null
+        : seatXs.map((sx, k) => (
+            <Person key={sx} x={sx} z={deskZ - 0.75} coat="#f8fafc" active anim={anim} seed={cell.cx + cell.cz + k * 2} />
+          ))}
+      <Chair x={0} z={deskZ + 0.95} />
       {/* Clinic pill: screen-aligned, never rotates. Always portal into the canvas box. */}
       <Html portal={portal} position={[0, 2.6, ROOM_BACK - 0.5]} center zIndexRange={[5, 0]} pointerEvents="none">
         <div className="whitespace-nowrap rounded-md bg-white/95 px-2 py-1 text-center text-xs shadow">
@@ -321,15 +463,19 @@ function ClinicRoom({ cell, anim }: { cell: Cell; anim: boolean }) {
 
 function ScreeningDesk({ hall, anim }: { hall: Hall; anim: boolean }) {
   const portal = useContext(LabelPortal) ?? undefined;
+  const nurses = [-3, 0, 3];
   return (
     <group position={[0, 0, hall.screenZ]}>
-      <mesh position={[0, 0.02, 0]}>
+      <mesh position={[0, 0.02, 0]} receiveShadow>
         <boxGeometry args={[hall.width - 1, 0.1, SCREEN_D - 1]} />
-        <meshStandardMaterial color="#99d5cd" />
+        <meshStandardMaterial color="#a9dbd2" map={edgeShadeTexture()} roughness={0.9} />
       </mesh>
-      <Desk x={0} z={0.2} w={Math.min(hall.width * 0.5, 12)} />
-      {[-3, 0, 3].map((x, i) => (
-        <Person key={x} x={x} z={-0.7} coat="#0f766e" active anim={anim} seed={i * 1.9} />
+      <Desk x={0} z={0.2} w={Math.min(hall.width * 0.5, 12)} seats={nurses} />
+      {nurses.map((x, i) => (
+        <Person key={x} x={x} z={-0.55} coat="#0f766e" active anim={anim} seed={i * 1.9} />
+      ))}
+      {nurses.map((x) => (
+        <Chair key={x} x={x + 0.2} z={1.05} />
       ))}
       <Html portal={portal} position={[0, 0.2, SCREEN_D / 2 - 0.4]} center zIndexRange={[5, 0]} pointerEvents="none">
         <div className="whitespace-nowrap rounded-md bg-brand-700 px-3 py-0.5 text-xs font-semibold text-white shadow">
@@ -356,19 +502,31 @@ function Rig({ goal }: { goal: Goal }) {
   return <OrbitControls ref={controls} makeDefault maxPolarAngle={Math.PI / 2.3} minDistance={6} maxDistance={220} />;
 }
 
-function Scene({ hall, anim, goal }: { hall: Hall; anim: boolean; goal: Goal }) {
+/** Tiled hall floor. */
+function Ground({ w, d }: { w: number; d: number }) {
+  const tex = useMemo(() => tileTexture("#cfd8dd", "#b3bfc6", w / 2.4, d / 2.4), [w, d]);
+  useEffect(() => () => tex.dispose(), [tex]);
+  return (
+    <mesh position={[0, -0.1, 0]} receiveShadow>
+      <boxGeometry args={[w, 0.2, d]} />
+      <meshStandardMaterial map={tex} roughness={0.55} metalness={0.05} />
+    </mesh>
+  );
+}
+
+function Scene({ hall, anim, goal, quality }: { hall: Hall; anim: boolean; goal: Goal; quality: Quality }) {
   const { queues, total } = useMemo(() => buildQueues(hall), [hall]);
+  const high = quality === "high";
   return (
     <>
-      <ambientLight intensity={1.1} />
-      <directionalLight position={[15, 30, 20]} intensity={1.6} />
-      <mesh position={[0, -0.1, 0]}>
-        <boxGeometry args={[hall.width + 6, 0.2, hall.depth + 6]} />
-        <meshStandardMaterial color="#cbd5e1" />
-      </mesh>
+      <SceneLights quality={quality} w={hall.width + 6} d={hall.depth + 6} />
+      {high ? <RoomEnv intensity={0.35} /> : null}
+      {high ? <DepthFog color={BG_COLOR} /> : null}
+      <Ground w={hall.width + 6} d={hall.depth + 6} />
       {hall.cells.map((cell) => (
         <ClinicRoom key={cell.clinic.clinicCode} cell={cell} anim={anim} />
       ))}
+      <Benches hall={hall} />
       <ScreeningDesk hall={hall} anim={anim} />
       {total > 0 ? <PatientMeshes queues={queues} total={total} anim={anim} /> : null}
       <Rig goal={goal} />
@@ -410,9 +568,11 @@ export default function OpdScene({ clinics }: { clinics: ClinicWait[] }) {
     () => null,
   );
   const [anim, setAnim] = useState(readAnimPref);
+  const [quality, setQuality] = useState<Quality>(readQuality);
   const [visible, setVisible] = useState(true);
   const box = useRef<HTMLDivElement>(null);
   const hall = useMemo(() => layoutHall(clinics), [clinics]);
+  const glProps = useMemo(() => canvasProps(quality), [quality]);
   const goal = useMemo<Goal>(
     () => ({ key: `${hall.width}x${hall.depth}`, cx: 0, cz: hall.depth * 0.07, w: hall.width, d: hall.depth * 0.95, margin: 1 }),
     [hall.width, hall.depth],
@@ -440,18 +600,20 @@ export default function OpdScene({ clinics }: { clinics: ClinicWait[] }) {
     <div className="space-y-2">
       <div ref={box} className="relative h-[520px] overflow-hidden rounded-md bg-brand-50 lg:h-[680px]">
         <Canvas
+          key={quality}
+          {...glProps}
           frameloop={anim && visible ? "always" : "demand"}
-          dpr={[1, 1.5]}
           camera={{ position: [0, 60, 50], fov: 45, far: 600 }}
         >
           <LabelPortal.Provider value={box as RefObject<HTMLElement>}>
-            <Scene hall={hall} anim={anim} goal={goal} />
+            <Scene hall={hall} anim={anim} goal={goal} quality={quality} />
           </LabelPortal.Provider>
         </Canvas>
         <div className="absolute right-3 top-3 flex flex-col items-end gap-2">
           <button type="button" className={buttonGhostClass} aria-pressed={anim} onClick={toggleAnim}>
             ภาพเคลื่อนไหว {anim ? "เปิด" : "ปิด"}
           </button>
+          <QualityToggle quality={quality} onChange={setQuality} />
         </div>
       </div>
       <Legend />
