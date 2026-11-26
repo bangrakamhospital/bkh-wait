@@ -12,8 +12,8 @@ import {
 } from "react";
 import { Canvas, useFrame, useThree } from "@react-three/fiber";
 import { Edges, Html, OrbitControls } from "@react-three/drei";
-import { Color, DynamicDrawUsage, MathUtils, Object3D, Vector3 } from "three";
-import type { Group, InstancedMesh } from "three";
+import { CanvasTexture, Color, DynamicDrawUsage, MathUtils, Object3D, SRGBColorSpace, Vector3 } from "three";
+import type { Group, InstancedMesh, PerspectiveCamera } from "three";
 import type { DepartmentOccupancy, WardOccupancy } from "@/lib/beds/types";
 import { BedGrid2D } from "./BedGrid2D";
 import { bedsInUse } from "./beds";
@@ -23,9 +23,9 @@ import { WardDetail } from "./WardDetail";
 
 const ZONE_COLS = 2;
 const ROOMS_PER_ZONE_ROW = 2;
-const GAP = 1.5;
+const GAP = 3;
 const ZONE_PAD = 1.5;
-const ZONE_GAP = 3;
+const ZONE_GAP = 4;
 /** Strip at the front edge of every zone reserved for the department label. */
 const LABEL_STRIP = 2.2;
 /** One fixed bed footprint everywhere; rooms grow with their bed grid. */
@@ -62,6 +62,7 @@ type RoomLayout = {
   w: number;
   d: number;
   cols: number;
+  col: number;
   rows: number;
 };
 type ZoneLayout = {
@@ -88,11 +89,20 @@ type SceneLayout = {
   width: number;
   depth: number;
 };
-type Goal = {
-  key: string;
-  pos: [number, number, number];
-  target: [number, number, number];
-};
+/** What the camera should frame: a box on the floor plus a margin (room for labels). */
+type Goal = { key: string; cx: number; cz: number; w: number; d: number; margin: number };
+
+const VIEW_ELEV = Math.atan2(0.9, 0.8);
+
+/** Camera position that fits the goal box into the current viewport aspect, with perspective slack. */
+function goalPose(g: Goal, fov: number, aspect: number): Vector3 {
+  const v = (fov * Math.PI) / 180;
+  const h = 2 * Math.atan(Math.tan(v / 2) * aspect);
+  // Bounding sphere: stays fully in view from every auto-rotate angle.
+  const radius = Math.hypot(g.w, g.d) / 2 + g.margin;
+  const dist = Math.max(14, (radius / Math.sin(Math.min(v, h) / 2)) * 1.05);
+  return new Vector3(g.cx, dist * Math.sin(VIEW_ELEV), g.cz + dist * Math.cos(VIEW_ELEV));
+}
 type View = { kind: "overview" | "ward" | "dept"; code: string; n: number };
 /** Mutable animation state shared by rooms, beds and the camera rig (never read during render). */
 type Shared = { lift: Record<string, number>; introAt: number };
@@ -224,6 +234,7 @@ function layoutScene(wards: WardOccupancy[], departments: DepartmentOccupancy[])
         w: room.w,
         d: room.d,
         cols: room.cols,
+        col,
         rows: room.rows,
       });
     });
@@ -373,6 +384,49 @@ function Beds({ items, anim }: { items: BedItem[]; anim: boolean }) {
   );
 }
 
+const FLOOR_LABEL_H = 1.4;
+
+/** Flat text on the floor, drawn to a canvas texture (system fonts cover Thai; no font download). */
+function FloorLabel({ text, width, z }: { text: string; width: number; z: number }) {
+  const texture = useMemo(() => {
+    const W = 1024;
+    const H = Math.round((W * FLOOR_LABEL_H) / width);
+    const canvas = document.createElement("canvas");
+    canvas.width = W;
+    canvas.height = H;
+    const ctx = canvas.getContext("2d");
+    if (ctx) {
+      ctx.fillStyle = "#14635f";
+      ctx.beginPath();
+      ctx.roundRect(0, 0, W, H, H * 0.25);
+      ctx.fill();
+      const family = getComputedStyle(document.body).fontFamily || "sans-serif";
+      let size = H * 0.6;
+      ctx.font = `600 ${size}px ${family}`;
+      const measured = ctx.measureText(text).width;
+      if (measured > W * 0.9) {
+        size = (size * W * 0.9) / measured;
+        ctx.font = `600 ${size}px ${family}`;
+      }
+      ctx.fillStyle = "#ffffff";
+      ctx.textAlign = "center";
+      ctx.textBaseline = "middle";
+      ctx.fillText(text, W / 2, H / 2);
+    }
+    const t = new CanvasTexture(canvas);
+    t.colorSpace = SRGBColorSpace;
+    t.anisotropy = 4;
+    return t;
+  }, [text, width]);
+  useEffect(() => () => texture.dispose(), [texture]);
+  return (
+    <mesh position={[0, 0.1, z]} rotation={[-Math.PI / 2, 0, 0]}>
+      <planeGeometry args={[width, FLOOR_LABEL_H]} />
+      <meshBasicMaterial map={texture} transparent toneMapped={false} />
+    </mesh>
+  );
+}
+
 function Zone({ zone }: { zone: ZoneLayout }) {
   return (
     <group position={[zone.cx, 0, zone.cz]}>
@@ -380,12 +434,8 @@ function Zone({ zone }: { zone: ZoneLayout }) {
         <boxGeometry args={[zone.w, 0.1, zone.d]} />
         <meshStandardMaterial color="#99d5cd" />
       </mesh>
-      {/* Department label sits on the floor at the front edge of the zone; ward labels float above the rooms. */}
-      <Html position={[0, 0.3, zone.d / 2 - LABEL_STRIP / 2 - 0.1]} center zIndexRange={[5, 0]} pointerEvents="none">
-        <div className="whitespace-nowrap rounded-md bg-brand-700 px-3 py-0.5 text-sm font-semibold text-white shadow">
-          แผนก{zone.name}
-        </div>
-      </Html>
+      {/* Department tag lies flat on the floor in the zone's front margin, so it can never overlap a room. */}
+      <FloorLabel text={`แผนก${zone.name}`} width={Math.min(zone.w - 1, 12)} z={zone.d / 2 - LABEL_STRIP / 2} />
     </group>
   );
 }
@@ -394,12 +444,14 @@ function Room({
   room,
   active,
   anim,
+  showLabel,
   onHover,
   onSelect,
 }: {
   room: RoomLayout;
   active: boolean;
   anim: boolean;
+  showLabel: boolean;
   onHover: (code: string | null) => void;
   onSelect: (code: string) => void;
 }) {
@@ -455,21 +507,29 @@ function Room({
           />
           {active ? <Edges color="#0f766e" /> : null}
         </mesh>
-        <Html position={[0, 1.4, -d / 2 - 0.2]} center zIndexRange={[10, 0]} pointerEvents="none">
-          <div
-            className={`whitespace-nowrap rounded-md px-2 py-0.5 text-xs font-medium shadow ${
-              over ? "bg-red-600 text-white" : "bg-white/90 text-slate-800"
-            }`}
+        {showLabel ? (
+          <Html
+            position={[0, 2.2 + (room.col % 2) * 1.8, -d / 2 + 0.6]}
+            center
+            zIndexRange={[20, 0]}
+            pointerEvents="none"
           >
-            {ward.wardName} ว่าง {fmtNum(ward.available)}/{fmtNum(ward.beds)}
-          </div>
-        </Html>
-        {ward.available > 0 ? (
-          <Html position={[0, 3.4, 0]} center zIndexRange={[8, 0]} pointerEvents="none">
             <div className={anim ? "bed-float" : undefined}>
-              <span className="whitespace-nowrap rounded-full bg-emerald-600 px-2 py-0.5 text-xs font-semibold text-white shadow">
-                +{fmtNum(ward.available)} ว่าง
-              </span>
+              <div
+                className={`flex items-center gap-1.5 whitespace-nowrap rounded-full px-2 py-0.5 text-xs shadow ${
+                  over ? "bg-red-50 ring-1 ring-red-600" : "bg-white/95"
+                }`}
+              >
+                <span className="font-semibold text-slate-800">{ward.wardName}</span>
+                <span
+                  className={`rounded-full px-2 py-0.5 font-semibold text-white ${
+                    ward.available > 0 ? "bg-emerald-600" : "bg-red-600"
+                  }`}
+                >
+                  {over ? "เกิน" : ward.available > 0 ? `ว่าง ${fmtNum(ward.available)}` : "เต็ม"}
+                </span>
+                <span className="text-slate-500">/{fmtNum(ward.beds)}</span>
+              </div>
             </div>
           </Html>
         ) : null}
@@ -485,6 +545,7 @@ function CameraRig({ goal, anim, idleOk }: RigProps) {
   const controls = useRef<ComponentRef<typeof OrbitControls>>(null);
   const camera = useThree((s) => s.camera);
   const invalidate = useThree((s) => s.invalidate);
+  const size = useThree((s) => s.size);
   const latest = useRef<RigProps>({ goal, anim, idleOk });
   const flight = useRef<{ pos: Vector3; target: Vector3 } | null>(null);
   const lastActive = useRef(0);
@@ -498,8 +559,8 @@ function CameraRig({ goal, anim, idleOk }: RigProps) {
     const c = controls.current;
     if (!c) return;
     const { goal: g, anim: animated } = latest.current;
-    const pos = new Vector3(...g.pos);
-    const target = new Vector3(...g.target);
+    const pos = goalPose(g, (camera as PerspectiveCamera).fov, size.width / Math.max(size.height, 1));
+    const target = new Vector3(g.cx, 0, g.cz);
     if (!animated) {
       camera.position.copy(pos);
       c.target.copy(target);
@@ -515,7 +576,7 @@ function CameraRig({ goal, anim, idleOk }: RigProps) {
     }
     flight.current = { pos, target };
     lastActive.current = now();
-  }, [goal.key, camera, controls, invalidate]);
+  }, [goal.key, size.width, size.height, camera, controls, invalidate]);
 
   useEffect(() => {
     const c = controls.current;
@@ -561,7 +622,7 @@ function CameraRig({ goal, anim, idleOk }: RigProps) {
     }
     const { anim: animated, idleOk: ok } = latest.current;
     c.autoRotate = animated && ok && !flight.current && now() - lastActive.current > IDLE_SECONDS;
-    c.autoRotateSpeed = 0.6;
+    c.autoRotateSpeed = 0.35;
   });
 
   return <OrbitControls ref={controls} makeDefault maxPolarAngle={Math.PI / 2.3} minDistance={6} maxDistance={220} />;
@@ -573,12 +634,14 @@ function Scene({
   anim,
   goal,
   idleOk,
+  labelCodes,
   onHover,
   onSelect,
 }: {
   layout: SceneLayout;
   activeCode: string | null;
   anim: boolean;
+  labelCodes: ReadonlySet<string> | null;
   goal: Goal;
   idleOk: boolean;
   onHover: (code: string | null) => void;
@@ -609,7 +672,7 @@ function Scene({
           room={r}
           active={r.ward.wardCode === activeCode}
           anim={anim}
-
+          showLabel={labelCodes === null || labelCodes.has(r.ward.wardCode)}
           onHover={onHover}
           onSelect={onSelect}
         />
@@ -640,9 +703,8 @@ function Legend() {
   );
 }
 
-function fitGoal(key: string, cx: number, cz: number, w: number, d: number, scale: number, min: number): Goal {
-  const reach = Math.max(min, Math.max(w, d * 1.3) * scale);
-  return { key, pos: [cx, reach * 0.9, cz + reach * 0.8], target: [cx, 0, cz] };
+function fitGoal(key: string, cx: number, cz: number, w: number, d: number, margin: number): Goal {
+  return { key, cx, cz, w, d, margin };
 }
 
 export default function BedScene({
@@ -701,14 +763,21 @@ export default function BedScene({
     const key = `${view.kind}:${view.code}:${view.n}`;
     if (view.kind === "ward") {
       const r = layout.rooms.find((x) => x.ward.wardCode === view.code);
-      if (r) return fitGoal(key, r.cx, r.cz, r.w, r.d, 1.25, 11);
+      if (r) return fitGoal(key, r.cx, r.cz, r.w, r.d, 3);
     }
     if (view.kind === "dept") {
       const z = layout.zones.find((x) => x.code === view.code);
-      if (z) return fitGoal(key, z.cx, z.cz, z.w, z.d, 1, 14);
+      if (z) return fitGoal(key, z.cx, z.cz, z.w, z.d, 4);
     }
-    return fitGoal(key, 0, 0, layout.width, layout.depth, 1, 14);
+    return fitGoal(key, 0, 0, layout.width + 6, layout.depth + 6, 5);
   }, [view, layout]);
+
+  // Hide ward labels outside the focus when zoomed into a ward or department.
+  const labelCodes = useMemo<ReadonlySet<string> | null>(() => {
+    if (view.kind === "ward") return new Set([view.code]);
+    if (view.kind === "dept") return new Set(departments.find((d) => d.departmentCode === view.code)?.wardCodes ?? []);
+    return null;
+  }, [view, departments]);
 
   if (webgl === null) return <div className="h-[420px]" />;
   if (!webgl) return <BedGrid2D wards={wards} />;
@@ -729,11 +798,11 @@ export default function BedScene({
 
   return (
     <div className="space-y-2">
-      <div ref={box} className="relative h-[520px] overflow-hidden rounded-md bg-brand-50">
+      <div ref={box} className="relative h-[520px] overflow-hidden lg:h-[600px] rounded-md bg-brand-50">
         <Canvas
           frameloop={anim && visible ? "always" : "demand"}
           dpr={[1, 1.5]}
-          camera={{ position: goal.pos, fov: 45, far: 600 }}
+          camera={{ position: [0, 60, 50], fov: 45, far: 600 }}
         >
           <Scene
             layout={layout}
@@ -741,6 +810,7 @@ export default function BedScene({
             anim={anim}
             goal={goal}
             idleOk={selected === null}
+            labelCodes={labelCodes}
             onHover={setHovered}
             onSelect={(code) => setView((v) => ({ kind: "ward", code, n: v.n + 1 }))}
           />
