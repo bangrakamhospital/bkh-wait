@@ -7,6 +7,7 @@ import { CATALOG_COLUMNS, toCatalogWard, type CatalogRow, type CatalogWard } fro
 import { countWaitingByWard } from "./refer";
 import type {
   BedBoard,
+  BedSlot,
   DepartmentCount,
   DepartmentOccupancy,
   OccupancyPoint,
@@ -23,7 +24,7 @@ export {
 /**
  * Bed board, read ONLY from PostgreSQL: the last successful HOSxP sync
  * (scripts/sync-hosxp.mjs writes wait.his_ward / ward_state /
- * ward_spclty_state / sync_run) + ward_config overrides, merged by the view
+ * ward_spclty_state / bed_slot / sync_run) + ward_config overrides, merged by the view
  * wait.ward_catalog (name, capacity, visible, virtual, department). HOSxP
  * definitions: scripts/lib/hosxp.mjs.
  *
@@ -86,6 +87,7 @@ interface SyncState {
   asOf: string;
   wards: { ward: CatalogWard; state: StateRow | undefined }[];
   spclty: Map<string, DepartmentCount[]>;
+  bedSlots: Map<string, BedSlot[]>;
 }
 
 /** Shown wards + their state from the last committed sync (one snapshot). */
@@ -94,7 +96,7 @@ async function readSyncState(): Promise<SyncState> {
   return withPgTransaction(
     async (tx) => {
       const [last] = await tx.query<{ finished_at: string }>(
-        "SELECT finished_at FROM sync_run WHERE ok ORDER BY finished_at DESC LIMIT 1",
+        "SELECT finished_at FROM sync_run WHERE ok AND job = 'beds' ORDER BY finished_at DESC LIMIT 1",
       );
       if (!last) {
         throw new ApiError(503, "SYNC_NOT_READY", "ยังไม่มีข้อมูลเตียงจากการซิงก์ HOSxP");
@@ -113,6 +115,23 @@ async function readSyncState(): Promise<SyncState> {
            FROM ward_spclty_state x
            LEFT JOIN his_spclty s ON s.spclty_code = x.spclty_code`,
       );
+      // Public bed layout (no patient data; HNs live in bed_occupant, which
+      // this role cannot read — see src/lib/beds/occupants.ts).
+      const slots = await tx.query<{
+        ward_code: string;
+        bedno: string;
+        bed_name: string;
+        room_name: string | null;
+        occupied: boolean;
+      }>(
+        "SELECT ward_code, bedno, bed_name, room_name, occupied FROM bed_slot ORDER BY ward_code, sort_order",
+      );
+      const bedSlots = new Map<string, BedSlot[]>();
+      for (const r of slots) {
+        const list = bedSlots.get(r.ward_code) ?? [];
+        list.push({ bedno: r.bedno, bedName: r.bed_name, roomName: r.room_name, occupied: r.occupied });
+        bedSlots.set(r.ward_code, list);
+      }
       const stateBy = new Map(states.map((r) => [r.ward_code, r]));
       const spclty = new Map<string, DepartmentCount[]>();
       for (const r of sp) {
@@ -125,6 +144,7 @@ async function readSyncState(): Promise<SyncState> {
         asOf: last.finished_at,
         wards: catalog.map((r) => ({ ward: toCatalogWard(r), state: stateBy.get(r.ward_code) })),
         spclty,
+        bedSlots,
       };
     },
     { snapshot: true },
@@ -152,6 +172,7 @@ async function buildBoard(): Promise<BedBoard> {
       referWaiting: waiting.get(w.wardCode) ?? 0,
       departmentCode: w.departmentCode,
       byDepartment: sync.spclty.get(w.wardCode) ?? [],
+      bedSlots: sync.bedSlots.get(w.wardCode) ?? [],
     };
     wards.push(row);
     const grp = groups.get(w.departmentCode) ?? { name: w.departmentName, sort: w.departmentSort, wards: [] };

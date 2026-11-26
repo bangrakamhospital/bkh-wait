@@ -1,9 +1,11 @@
 # bkh-wait API
 
 All endpoints live under `/api`, return JSON and use the types in
-`src/lib/beds/types.ts`. Only aggregate counts, ward configuration and
-refer-back metadata cross the API — never patient names, CID, HN, AN or bed
-numbers.
+`src/lib/beds/types.ts`. Only aggregate counts, ward configuration,
+refer-back metadata and the public bed layout (bed numbers + occupied flag)
+cross the API — never patient names, CID or AN. The ONE exception is the
+HN per bed of `GET /api/beds/occupants`: logged-in `staff` only, every
+view written to the audit log (see "Bed occupants").
 
 ## Conventions
 
@@ -15,13 +17,13 @@ numbers.
   | 400  | `VALIDATION`              | bad body / query; `error` names the field                        |
   | 401  | `UNAUTHENTICATED`         | not logged in / session expired, or wrong username/password      |
   | 403  | `FORBIDDEN`               | role not allowed, or cross-site request blocked                  |
-  | 404  | `NOT_FOUND`               | refer request id does not exist                                  |
+  | 404  | `NOT_FOUND`               | refer request id / ward does not exist                           |
   | 409  | `INVALID_TRANSITION`      | status change not allowed from the current status                |
   | 415  | `UNSUPPORTED_MEDIA_TYPE`  | write request without `Content-Type: application/json`           |
   | 429  | `TOO_MANY_ATTEMPTS`       | too many failed logins; `Retry-After` header (seconds)           |
   | 503  | `AUTH_NOT_CONFIGURED`     | `WAIT_SESSION_SECRET` not set on the server — login disabled     |
   | 503  | `WAIT_DB_NOT_CONFIGURED`  | PostgreSQL (`WAIT_DATABASE_URL`) not set — refer/config features off |
-  | 429  | `RATE_LIMITED`            | central API: too many calls for this key / failed keys from this IP; `Retry-After` |
+  | 429  | `RATE_LIMITED`            | central API: too many calls for this key / failed keys from this IP; bed occupants: too many calls for this user; `Retry-After` |
   | 503  | `SYNC_NOT_READY`          | no successful HOSxP sync yet (board has no data)                 |
   | 503  | `API_NOT_CONFIGURED`      | central API: `WAIT_API_KEYS` not set                             |
   | 500  | `INTERNAL`                | anything else                                                    |
@@ -93,6 +95,18 @@ Per ward (`WardOccupancy`):
 | `referWaiting`    | refer-back requests with status `waiting` for this ward (0 without PostgreSQL)                   |
 | `departmentCode`  | the group in `departments[]` this ward belongs to (see below)                                    |
 | `byDepartment`    | current patients of the ward split by HOSxP `ipt.spclty` (most first)                            |
+| `bedSlots`        | the physical beds (`BedSlot[]`), see below — public, no patient data                             |
+
+`bedSlots[]` (`BedSlot`): every HOSxP bed of the ward (`bedno` ⨝ `roomno`
+on `roomno.ward`), ordered by `roomno`, `bed_order` (empty last), `bedno`.
+`bedno` (HOSxP bed code, e.g. `"Y03"`), `bedName` (`bedno.bedname`, else
+`bedno` — HOSxP has no bed names today), `roomName` (`roomno.name`) and
+`occupied`: a current inpatient of this ward has this bed in `iptadm.bedno`
+(the same set as beds in use, so `count(occupied) = occupied - occupiedNoBed`).
+Patients without a bed of their own are not placed on any slot.
+`bedSlots.length` is the HOSxP bed count and can differ from `beds` when
+`ward_config.bed_capacity` overrides it. Written by the bed sync
+(`wait.bed_slot`), same `asOf`.
 
 `departments[]` (`DepartmentOccupancy`) — the bed departments (แผนก):
 - ward with `ward_config.department_code` → that department (`wait.department`);
@@ -117,6 +131,53 @@ request, including those without a ward.
 `beds` = capacity at that time, `bedsInUse` = beds in use (เตียงคนนอน) at
 that time, `null` for points taken before migration 002. Without PostgreSQL: `configured: false`,
 `points: []` (not an error). `Cache-Control: public, max-age=60`.
+
+## Bed occupants (staff only, HN)
+
+### `GET /api/beds/occupants?ward=01` (role `staff`)
+Who lies in which bed of one ward — for the 3D bed scene: a staff member
+taps a bed and sees the patient's HN.
+
+200
+```json
+{
+  "wardCode": "01",
+  "asOf": "2026-11-26T03:15:04.120Z",
+  "occupants": [
+    { "bedno": "040", "bedName": "040", "hn": "<HN>", "admitDate": "2026-11-20",
+      "lengthOfStayDays": 6, "spcltyName": "อายุรกรรม" }
+  ]
+}
+```
+`occupants` (`BedOccupant[]`) in `bedSlots` order; match them to the slots
+by `bedno`. `lengthOfStayDays` = today (Asia/Bangkok) − `admitDate`.
+`asOf` = the same bed sync as the board.
+
+| status | when |
+| ------ | ---- |
+| 401 `UNAUTHENTICATED` | no / expired session |
+| 403 `FORBIDDEN` | role `partner`, or a cross-site request (`Sec-Fetch-Site` other than `same-origin`/`none`, or a foreign `Origin`) |
+| 400 `VALIDATION` | `ward` missing or not 1–4 letters/digits |
+| 404 `NOT_FOUND` | ward not on the board (unknown, inactive, hidden or virtual) |
+| 429 `RATE_LIMITED` | more than 30 calls per minute for this user; `Retry-After` |
+| 503 | `SYNC_NOT_READY` / `WAIT_DB_NOT_CONFIGURED` |
+
+Privacy rules:
+- **HN is visible only to logged-in `staff`.** Never in `/api/board`, the
+  trend, snapshots, the daily census or the central API (`/api/v1/*`).
+- **Every view is audited.** The web app's database role cannot read
+  `wait.bed_occupant`; it can only call `wait.bed_occupants_for_ward(ward,
+  actor)` (db/006, `SECURITY DEFINER`), which returns the rows and appends
+  one `wait.audit_log` row (`actor` = username, `action` = `view_hn`,
+  `entity` = `ward`, `entity_id` = ward code, `detail.rows` = rows
+  returned) in the same statement. The audit row never contains an HN.
+  Review: `SELECT at, actor, entity_id, detail FROM wait.audit_log WHERE action = 'view_hn' ORDER BY at DESC;`
+- `Cache-Control: private, no-store`, `Vary: Cookie`; never cached on the
+  server (no memo). Fetch it when a bed is tapped, keep it in component
+  state only (no localStorage / URL), drop it when the scene closes.
+- Only the HN is stored (no AN, name or CID); the table is replaced on every
+  bed sync, so discharged patients disappear within 15 minutes. Database
+  backups now contain current inpatient HNs — protect them like HOSxP backups.
 
 ## Departments (bed grouping)
 
@@ -340,3 +401,113 @@ curl -s "https://10.10.10.159:84/api/v1/census?from=2026-11-01&to=2026-11-30" \
 | `wardName`, `departmentCode`, `departmentName` | ชื่อหอ / แผนก ณ วันนั้น |
 
 ข้อควรทราบ: ผู้ป่วยที่ย้ายหอจะถูกนับในหอปัจจุบัน/หอที่จำหน่าย (HOSxP `ipt.ward`)
+
+## OPD: waiting to see a doctor (การรอคอยการพบแพทย์แต่ละแผนก)
+
+Types: `src/lib/opd/types.ts` (`OpdBoard`, `ClinicWait`, `OpdHourPoint`,
+`OpdDaily`). Source: PostgreSQL only (`wait.opd_*`), written by the OPD
+sync worker `scripts/sync-opd.mjs` (cron every 5 min, 06:00–20:55
+Asia/Bangkok). The web app never queries HOSxP. Aggregates only — no HN,
+VN, names, queue numbers or doctor codes are stored or sent.
+
+### Definitions (HOSxP, `scripts/lib/hosxp-opd.mjs`)
+
+| term | definition |
+| --- | --- |
+| visit | `ovst` row of the day (`vstdate`), registration time = `vstdate + vsttime`. Visits registered at the ER (`main_dep = '011'`) are left out entirely (ER has its own triage, not an OPD queue). Cancelled visits are deleted from `ovst` by HOSxP, so they never appear. |
+| doctor exam start | the earliest `ovst_service_time.service_begin_datetime` with `ovst_service_time_type_code = 'OPD-DOCTOR'` of the visit, at a **clinic** (below). `OPD-NEW-VISIT` = registration (≈ `vsttime`), `OPD-SCREEN` = screening / vital signs (ซักประวัติ), `OPD-DOCTOR` = the doctor-room screen was opened. |
+| clinic (`clinicCode`) | a `kskdepartment.depcode` where doctor exams happen: any depcode with `OPD-DOCTOR` rows in the last 28 days, **minus** non-doctor points: `010` IPD, `011` ER, `027` physiotherapy, `020`/`061`/`062` screening points, `006` X-ray, `007` lab, `013` pharmacy, `014` cashier, `023` medical records, `060` insurance, `999` home. Name = `kskdepartment.department` without the leading `NNN-`. Staff can rename / hide / order clinics in `wait.opd_clinic_config` (SQL for now). |
+| clinic of a seen visit | the depcode of its doctor exam start |
+| clinic of a not-yet-seen visit | live: `cur_dep` when it is a *queue clinic* (a clinic some route points to); else the **route** of `cur_dep`, else the route of `main_dep`. Closed day: the route of `main_dep`. Route of a department = the clinic where most of its visits saw a doctor over the last 28 days, used only when it had ≥ 5 visits and ≥ 50 % of them saw a doctor (e.g. `061` general screening → `001`, `062` NCD screening → `047`, `020` psych screening → `064`, `032` → `030`). Departments whose visits mostly never see a doctor (lab-only `007`, dental `008`, eye `018`, …) have no route, so those visits are not "waiting for a doctor". |
+| wait (seen) | doctor exam start − registration, minutes (negative → 0). Waits over 720 min (doctor screen opened on a later day) are left out of the averages. |
+| waiting now (`waitingNow`) | visit of today with a clinic, no doctor exam start yet, not admitted (`ovst.an` empty), `cur_dep` not pharmacy `013` / cashier `014` / home `999` / IPD `010` / ER `011`, and registered at most **480 min** ago (older ones are treated as stale — the patient left or the doctor never opened the screen). |
+| `waitingForDoctor` | of those: already screened (`OPD-SCREEN` row) or `cur_dep` is the clinic itself — waiting in front of the doctor room. |
+| `longestWaitMinutes` | longest registration → now among `waitingNow` (0 when none) |
+| `seenToday`, `avg/median/p90WaitMinutes` | visits whose doctor exam start is today, at this clinic; wait stats over those (null when none) |
+| `seenLastHour` | doctor exam starts in the last 60 min |
+| `doctorsActive` | distinct `ovst_service_time.doctor` with an `OPD-DOCTOR` row at this clinic in the last 60 min |
+| `estimatedWaitMinutes` | rough wait of a patient arriving now: `ceil(waitingNow × 60 / seenLastHour)` = time to clear the current queue at the last hour's pace (all doctors of the clinic together), capped at 480. `null` when `seenLastHour = 0` (no doctor working right now — unknown). `0` when nobody waits and doctors are working. |
+
+Typical values (verified on HOSxP 2026-10-29 … 2026-11-25): general OPD `001`
+mean 140 min, NCD `047` mean 236 min (patients register from 06:00 for
+fasting labs, doctors start about 09:00), PCU `030` mean 62 min — see the
+report of the feature branch for the per-day numbers.
+
+### `GET /api/opd/board` (public)
+
+200 `OpdBoard`. `Cache-Control: public, max-age=30, stale-while-revalidate=60`;
+memoised 10 s per process. All minute values are whole minutes (rounded).
+
+```json
+{
+  "asOf": "2026-11-26T04:20:05.000Z",
+  "stale": false,
+  "date": "2026-11-26",
+  "clinics": [
+    {
+      "clinicCode": "001", "clinicName": "ห้องตรวจโรคทั่วไป",
+      "waitingNow": 18, "waitingForDoctor": 9, "longestWaitMinutes": 175,
+      "seenToday": 76, "avgWaitMinutes": 121, "medianWaitMinutes": 110, "p90WaitMinutes": 190,
+      "doctorsActive": 2, "seenLastHour": 14, "estimatedWaitMinutes": 78
+    }
+  ],
+  "hourly": [ { "hour": 8, "arrived": 120, "seen": 0, "avgWaitMinutes": null } ],
+  "totals": {
+    "waitingNow": 60, "waitingForDoctor": 31, "seenToday": 290,
+    "avgWaitMinutes": 130, "medianWaitMinutes": 115, "longestWaitMinutes": 290
+  }
+}
+```
+(example numbers are made up)
+
+- `asOf`: finish time of the last successful OPD sync (ISO, UTC); `date`:
+  the HOSxP day it describes (before the first run of the day this is
+  yesterday — the UI should show it).
+- `stale`: `true` when, between 06:15 and 20:30 Asia/Bangkok, the last OPD
+  sync is older than 15 minutes, or at any time when it is older than 16 h.
+- `clinics`: every visible clinic active in the last 28 days (zeros
+  allowed), ordered by `opd_clinic_config.sort_order`, then by today's
+  visits (most first), then code.
+- `hourly`: hours 0–23 of `date` (all 24, zeros allowed), over visible
+  clinics: `arrived` = registrations in that hour (visits with a clinic),
+  `seen` = doctor exam starts in that hour, `avgWaitMinutes` = mean wait of
+  those seen in that hour.
+- `totals`: over visible clinics; `median` over all their seen visits
+  (not a median of medians).
+- 503 `SYNC_NOT_READY` before the first successful OPD sync,
+  503 `WAIT_DB_NOT_CONFIGURED` without PostgreSQL.
+
+### Central API: `GET /api/v1/opd/current`
+
+Same auth / rate limit / audit as the other `/api/v1` endpoints.
+
+```json
+{ "hospcode": "11252", "asOf": "…", "stale": false, "date": "2026-11-26",
+  "totals": { …OpdBoard.totals },
+  "clinics": [ …ClinicWait ] }
+```
+
+### Central API: `GET /api/v1/opd/daily?from=YYYY-MM-DD&to=YYYY-MM-DD`
+
+At most 92 days (same validation as `/api/v1/census`).
+
+```json
+{
+  "hospcode": "11252", "from": "2026-11-01", "to": "2026-11-30",
+  "generatedAt": "…", "lastSyncAt": "…", "stale": false,
+  "days": [
+    { "date": "2026-11-25", "finalized": true, "visits": 520, "seen": 470,
+      "avgWaitMinutes": 128, "medianWaitMinutes": 112, "p90WaitMinutes": 240, "within60Pct": 24.3 }
+  ],
+  "rows": [ …OpdDaily ]
+}
+```
+
+`rows` (`OpdDaily`, one per date × clinic): `visits` = visits whose clinic
+is this one (seen here, or routed here and never seen), `seen` = saw a
+doctor here, wait stats over `seen` (waits > 720 min left out),
+`within60Pct` = share of `seen` within 60 min of registration (1 decimal).
+`days` = whole hospital per day, computed from all visits (median of all
+waits, not of the clinic medians). `finalized`: `false` = today (changes
+every 5 min) · `true` = recomputed for the whole day from HOSxP by the
+first OPD sync of a later day, never changes again.

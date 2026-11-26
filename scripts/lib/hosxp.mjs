@@ -1,8 +1,11 @@
 // HOSxP (MySQL/MariaDB, read-only) access for the sync worker
 // (scripts/sync-hosxp.mjs). This is the ONLY place in bkh-wait that holds
 // HOSxP SQL; the web app never connects to HOSxP — it reads the copies the
-// worker writes to PostgreSQL. Aggregates only: no AN, HN, names or bed
-// numbers leave this module.
+// worker writes to PostgreSQL. Aggregates only, with ONE exception:
+// fetchBedOccupants() returns the HN per occupied bed, which the worker
+// writes ONLY to the restricted table wait.bed_occupant (db/006; readable
+// solely through the audited function wait.bed_occupants_for_ward). No AN,
+// names or CID leave this module; HNs are never logged or printed.
 //
 // Definitions (verified with db-cli on 2026-11-26):
 // - Active wards: `ward.ward_active = 'Y'`.
@@ -28,6 +31,13 @@
 //   not discharged on or before D (dchdate IS NULL OR dchdate > D), same
 //   180-day cutoff counted back from D.
 // - Clinical department: ipt.spclty -> spclty.name.
+// - Bed slots: every bedno of the ward (bedno JOIN roomno, roomno.ward),
+//   ordered roomno, bed_order (NULLs last), bedno. bedno.bedname is empty
+//   for every bed (checked 2026-11-26), so the bed name falls back to bedno.
+// - Bed occupants: current inpatients (same 180-day cutoff) whose
+//   iptadm.bedno belongs to their CURRENT ward (roomno.ward = ipt.ward) —
+//   the same set as "beds in use". Patients without such a bed are only
+//   counted (occupiedNoBed), never placed on a bed.
 
 import mysql from "mysql2/promise";
 
@@ -235,4 +245,58 @@ export async function fetchDominantSpclty(his) {
     if (!cur || n > cur.n) best.set(String(r.ward_code), { n, spcltyCode: String(r.spclty_code) });
   }
   return new Map([...best].map(([k, v]) => [k, v.spcltyCode]));
+}
+
+/**
+ * Physical beds of the active wards, in HOSxP order (public: no patient
+ * data). Callers drop virtual wards.
+ */
+export async function fetchBedSlots(his) {
+  const rows = await his.query(
+    `SELECT r.ward AS ward_code, b.bedno, b.bedname, b.roomno, r.name AS room_name
+       FROM bedno b
+       JOIN roomno r ON r.roomno = b.roomno
+       JOIN ward w ON w.ward = r.ward AND w.ward_active = 'Y'
+      ORDER BY r.ward, r.roomno, b.bed_order IS NULL, b.bed_order, b.bedno`,
+  );
+  return rows
+    .filter((r) => r.bedno !== null && String(r.bedno).trim() !== "")
+    .map((r) => {
+      const bedno = String(r.bedno).trim();
+      return {
+        wardCode: String(r.ward_code),
+        bedno,
+        bedName: (r.bedname ?? "").trim() || bedno,
+        roomNo: r.roomno === null ? null : String(r.roomno),
+        roomName: (r.room_name ?? "").trim() || null,
+      };
+    });
+}
+
+/**
+ * RESTRICTED: current inpatient per bed (ward, bedno, HN, admit date,
+ * spclty). Only for wait.bed_occupant; never log or print the result.
+ * One row per AN (iptadm has one row per AN).
+ */
+export async function fetchBedOccupants(his) {
+  const rows = await his.query(
+    `SELECT i.ward AS ward_code, a.bedno, i.hn, i.regdate, i.spclty AS spclty_code
+       FROM ipt i
+       JOIN iptadm a ON a.an = i.an
+       JOIN bedno b ON b.bedno = a.bedno
+       JOIN roomno r ON r.roomno = b.roomno
+      WHERE i.dchdate IS NULL
+        AND i.regdate >= CURDATE() - INTERVAL :staleDays DAY
+        AND i.ward IS NOT NULL
+        AND r.ward = i.ward
+        AND i.hn IS NOT NULL AND i.hn <> ''`,
+    { staleDays: STALE_ADMISSION_DAYS },
+  );
+  return rows.map((r) => ({
+    wardCode: String(r.ward_code),
+    bedno: String(r.bedno).trim(),
+    hn: String(r.hn).trim(),
+    admitDate: String(r.regdate).slice(0, 10),
+    spcltyCode: r.spclty_code === null || String(r.spclty_code).trim() === "" ? null : String(r.spclty_code),
+  }));
 }

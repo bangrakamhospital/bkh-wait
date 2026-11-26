@@ -9,7 +9,9 @@
     "lint": "eslint",
     "db:migrate": "node --env-file-if-exists=.env --env-file-if-exists=.env.local scripts/db-migrate.mjs",
     "sync": "node --env-file-if-exists=.env.sync scripts/sync-hosxp.mjs",
-    "sync:dry": "node --env-file-if-exists=.env.sync scripts/sync-hosxp.mjs --dry-run"
+    "sync:dry": "node --env-file-if-exists=.env.sync scripts/sync-hosxp.mjs --dry-run",
+    "sync:opd": "node --env-file-if-exists=.env.sync scripts/sync-opd.mjs",
+    "sync:opd:dry": "node --env-file-if-exists=.env.sync scripts/sync-opd.mjs --dry-run"
   },
   "dependencies": {
     "@react-three/drei": "^10.7.9",

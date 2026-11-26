@@ -1,22 +1,31 @@
-# bkh-wait — bed board / refer-back
+# bkh-wait — bed board / refer-back / OPD waiting
 
 Bed-occupancy and waiting dashboard for Bangrakam hospital (hospcode 11252).
 The regional hospital sees, per ward and department, how many beds are free
 so it can refer patients back, and files refer-back requests that Bangrakam
 staff accept / admit. A machine API sends daily bed census to the central /
-regional level.
+regional level. The OPD board (`/opd`) shows, per clinic, how long
+patients wait from registration to the doctor (การรอคอยการพบแพทย์แต่ละแผนก).
 
 - Next.js 16 (App Router), React 19, TypeScript, Tailwind v4
 - **PostgreSQL** `bkh_wait`, schema `wait`: the ONLY database the web app
   talks to — `src/lib/db/pg.ts`, `db/`
-- **HOSxP** (MySQL, read-only) is read ONLY by the sync worker
-  `scripts/sync-hosxp.mjs` (cron, every 15 min), which has its own env file
+- **HOSxP** (MySQL, read-only) is read ONLY by the sync workers
+  `scripts/sync-hosxp.mjs` (beds, cron every 15 min) and `scripts/sync-opd.mjs`
+  (OPD waits, cron every 5 min 06:00-20:55), which have their own env file
   `.env.sync`. The web app has no HOSxP credentials.
-- API contract: [`docs/api.md`](docs/api.md); shared types: `src/lib/beds/types.ts`
+- API contract: [`docs/api.md`](docs/api.md); shared types: `src/lib/beds/types.ts`,
+  `src/lib/opd/types.ts`
 
-Only aggregate counts leave the server; no patient identifiers are stored
-or sent (refer-back requests carry a case reference of the sending hospital,
-13-digit IDs are rejected).
+Only aggregate counts leave the server (refer-back requests carry a case
+reference of the sending hospital, 13-digit IDs are rejected). The ONE
+patient identifier kept is the **HN per occupied bed** (`wait.bed_occupant`,
+db/006) for the 3D bed scene: staff tap a bed and see the HN. It is
+readable only by logged-in `staff` through `GET /api/beds/occupants`; the
+app's database role cannot SELECT the table and goes through the
+`SECURITY DEFINER` function `wait.bed_occupants_for_ward`, which writes an
+`audit_log` row (`view_hn`) for every view. Never in the public board or
+the central API. No AN, names or CID are stored anywhere.
 
 ## Architecture
 
@@ -27,9 +36,16 @@ HOSxP (MySQL, SELECT-only account)
 PostgreSQL bkh_wait.wait
    his_ward, his_spclty           ward / spclty names, HOSxP bed capacity
    ward_state, ward_spclty_state  current census (last successful sync)
+   bed_slot                       physical beds + occupied flag (public)
+   bed_occupant                   RESTRICTED: HN per occupied bed; app reads it only via
+                                  bed_occupants_for_ward() (audited), sync role write-only
    occupancy_snapshot             history, one row per ward per sync
    daily_census                   one row per (date, ward), finalized after midnight
-   sync_run                       one row per run (ok / error code)
+   sync_run                       one row per run (job beds | opd, ok / error code)
+   his_opd_clinic, opd_route      OPD clinics (kskdepartment) + department -> clinic routes
+   opd_state, opd_hourly          OPD waits now / per hour (scripts/sync-opd.mjs, every 5 min)
+   opd_daily                      one row per (date, clinic), finalized the next day
+   opd_clinic_config              staff overrides of clinic name / visible / order (SQL)
    ward_config, department        staff overrides (PUT /api/departments)
    ward_catalog (view)            HOSxP wards + overrides = the one definition
    │                              of name, capacity, virtual, department
@@ -37,7 +53,11 @@ PostgreSQL bkh_wait.wait
 Next.js web app (pm2, 127.0.0.1:3084, nginx :84)
    /            board (asOf = last sync, "stale" warning after 30 min)
    /api/board, /api/trend, /api/refer, /api/departments
-   /api/v1/census, /api/v1/beds/current   central API (Bearer key)
+   /api/beds/occupants            HN per bed, staff session only, audited
+   /opd         OPD board (stale after 15 min during 06:15-20:30)
+   /api/opd/board
+   /api/v1/census, /api/v1/beds/current, /api/v1/opd/current, /api/v1/opd/daily
+                                          central API (Bearer key)
 ```
 
 ## Bed definitions (HOSxP, `scripts/lib/hosxp.mjs`)
@@ -49,12 +69,28 @@ Next.js web app (pm2, 127.0.0.1:3084, nginx :84)
 | patients | `ipt.dchdate IS NULL AND ipt.regdate >= CURDATE() - INTERVAL 180 DAY` (`ipt.ward` = current ward) |
 | beds in use (เตียงคนนอน) | distinct `iptadm.bedno` of those patients (bed of their current ward) |
 | free (เตียงว่าง) | `max(beds - beds in use, 0)` |
+| bed slots | every `bedno ⨝ roomno` of the ward, order `roomno`, `bed_order`, `bedno`; occupied = a current patient of the ward has it in `iptadm.bedno` |
 | department | `ward_config.department_code` → `wait.department`; fallback: ward's dominant `ipt.spclty` |
 | admitted / discharged (day D) | `ipt.regdate = D` / `ipt.dchdate = D` |
 | patient days (day D) | midnight census: `regdate <= D AND (dchdate IS NULL OR dchdate > D)`, same 180-day cutoff |
 
 180-day cutoff: a few never-discharged `ipt` rows from 2024-07..2025-01
 (ward NULL) are leftovers; the longest real stay in two years was 90 days.
+
+## OPD definitions (HOSxP, `scripts/lib/hosxp-opd.mjs`)
+
+Wait = registration (`ovst.vstdate + vsttime`) → first `ovst_service_time`
+row of type `OPD-DOCTOR` at a doctor-exam clinic. Clinics, routes, the
+waiting / stale rules and the estimate are defined in the header of
+`scripts/lib/hosxp-opd.mjs` and in [`docs/api.md`](docs/api.md) "OPD".
+Rename / hide / order a clinic (until there is a settings page):
+
+```sql
+INSERT INTO wait.opd_clinic_config (clinic_code, display_name, visible, sort_order, updated_by)
+VALUES ('001', 'ห้องตรวจโรคทั่วไป', true, 10, 'admin')
+ON CONFLICT (clinic_code) DO UPDATE SET display_name = EXCLUDED.display_name,
+  visible = EXCLUDED.visible, sort_order = EXCLUDED.sort_order, updated_at = now();
+```
 
 ## Development
 
@@ -64,6 +100,7 @@ cp .env.sync.example .env.sync  # HIS_* + WAIT_SYNC_DATABASE_URL (sync worker)
 npm ci
 npm run dev                     # http://localhost:3001
 npm run sync:dry                # read HOSxP, print what would be written (no PostgreSQL)
+npm run sync:opd:dry            # same for the OPD worker (add -- --date=YYYY-MM-DD for a past day)
 npx tsc --noEmit && npm run lint
 ```
 
@@ -98,15 +135,29 @@ Path `/var/www/wait`, deploy only `main`. pm2 process `bkh-wait` on
   before the switch leaves the old app and its cron working; fix and
   re-run. Existing history is kept.
 
-Later deploys:
+Every later deploy (including the OPD board and the bed-HN upgrade):
 
 ```bash
-cd /var/www/wait
-git fetch origin main && git reset --hard origin/main
-npm ci --no-audit --no-fund && npm run build
-npm run db:migrate                  # no-op when up to date
-pm2 restart bkh-wait --update-env
+cd /var/www/wait && git fetch origin main && git reset --hard origin/main
+bash scripts/server-upgrade.sh
 ```
+
+`scripts/server-upgrade.sh` (as bkhadmin, no sudo, safe to re-run): git
+reset to origin/main, npm ci, preflight dry run of both workers, pending
+migrations (005 OPD, 006 bed slots / occupants, ...), one bed sync,
+build, pm2 restart, first OPD sync with 30 days backfill when OPD is new,
+adds the bed / OPD cron lines if missing, then checks `/api/board` has
+`bedSlots` and `/api/beds/occupants` answers 401 without login.
+`scripts/server-upgrade-opd.sh` is now a wrapper around it.
+
+Upgrade notes for 006 (bed HN):
+- Additive: new tables `bed_slot`, `bed_occupant`, function
+  `bed_occupants_for_ward`. The app needs 006 before it starts (the board
+  reads `bed_slot`) — the script migrates before the restart.
+- From now on the PostgreSQL database (and its backups) holds the HN of
+  current inpatients. Keep backups as protected as HOSxP's.
+- Audit of HN views:
+  `SELECT at, actor, entity_id AS ward, detail->>'rows' AS rows FROM wait.audit_log WHERE action = 'view_hn' ORDER BY at DESC LIMIT 50;`
 
 ### Env files (both mode 0600, never committed)
 
@@ -115,7 +166,7 @@ pm2 restart bkh-wait --update-env
 | `.env` | web app (Next reads it), `db:migrate` | `WAIT_DATABASE_URL` (role `bkh_wait_app`), `WAIT_MIGRATE_DATABASE_URL` (owner), `WAIT_SESSION_SECRET`, `WAIT_USERS`, `WAIT_API_KEYS`, `WAIT_API_CORS_ORIGINS`, `WAIT_COOKIE_INSECURE` |
 | `.env.sync` | sync worker only | `HIS_HOST/PORT/USER/PASSWORD/DATABASE`, `WAIT_SYNC_DATABASE_URL` (role `bkh_wait_sync`) |
 
-### Sync worker (every 15 min)
+### Sync workers (beds every 15 min, OPD every 5 min 06:00-20:55)
 
 ```cron
 */15 * * * * cd /var/www/wait && /usr/bin/node --env-file=/var/www/wait/.env.sync scripts/sync-hosxp.mjs >> /var/www/wait/logs/sync.log 2>&1
@@ -125,6 +176,15 @@ Each run logs one line (`sync ok: run N, 8 ward(s), ...` or
 `sync FAILED: HIS_ECONNREFUSED`) and writes a `wait.sync_run` row. Failures
 never contain hosts or passwords. `--dry-run` reads HOSxP only and prints
 the aggregates. The board flags data older than 30 minutes as stale.
+
+```cron
+*/5 6-20 * * * cd /var/www/wait && /usr/bin/node --env-file=/var/www/wait/.env.sync scripts/sync-opd.mjs >> /var/www/wait/logs/sync-opd.log 2>&1
+```
+
+OPD runs log `opd sync ok: run N, <date>, 14 clinic(s), waiting W, seen S ...`
+(own advisory lock, `sync_run.job = 'opd'`). The first run of a day finalizes
+the earlier open days of `opd_daily`; `--backfill=N` fills up to 92 past days
+that have no rows yet.
 
 ## Migrations
 

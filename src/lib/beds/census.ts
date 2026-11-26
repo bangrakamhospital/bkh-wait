@@ -86,7 +86,7 @@ export async function getDailyCensus(from: string, to: string): Promise<DailyCen
 export async function getLastSyncAt(): Promise<string | null> {
   if (!isWaitDbConfigured()) throw new WaitDbConfigError("wait database is not configured");
   const [row] = await pgQuery<{ finished_at: string }>(
-    "SELECT finished_at FROM sync_run WHERE ok ORDER BY finished_at DESC LIMIT 1",
+    "SELECT finished_at FROM sync_run WHERE ok AND job = 'beds' ORDER BY finished_at DESC LIMIT 1",
   );
   return row?.finished_at ?? null;
 }

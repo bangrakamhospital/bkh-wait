@@ -97,6 +97,20 @@ export function isSameOriginRequest(headers: Headers): boolean {
   }
 }
 
+/**
+ * CSRF check for sensitive authenticated GETs (the session cookie is
+ * SameSite=Lax, so a cross-site top-level navigation would carry it):
+ * Sec-Fetch-Site, when sent, must be same-origin (or none = typed URL), and
+ * an Origin header, when sent, must be this host.
+ */
+export function assertSameOriginRead(headers: Headers): void {
+  const site = headers.get("sec-fetch-site");
+  let ok = !site || site === "same-origin" || site === "none";
+  const origin = headers.get("origin");
+  if (ok && origin !== null) ok = isSameOriginRequest(headers);
+  if (!ok) throw new ApiError(403, "FORBIDDEN", "คำขอไม่ได้มาจากหน้าเว็บของระบบ");
+}
+
 const MAX_BODY_BYTES = 16 * 1024;
 
 /**

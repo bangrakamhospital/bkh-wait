@@ -27,7 +27,9 @@ export function LoginForm() {
         setSaving(false);
         return;
       }
-      router.push("/refer");
+      // Return to the page that sent the user here (same-origin paths only).
+      const next = new URLSearchParams(window.location.search).get("next");
+      router.push(next && next.startsWith("/") && !next.startsWith("//") ? next : "/refer");
       router.refresh();
     } catch {
       setError("ไม่สามารถเชื่อมต่อเซิร์ฟเวอร์ได้");
