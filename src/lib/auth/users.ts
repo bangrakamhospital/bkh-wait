@@ -3,21 +3,25 @@ import "server-only";
 import { createHash, scrypt, timingSafeEqual, type ScryptOptions } from "node:crypto";
 
 /**
- * Staff accounts configured in env (no user table: a handful of refer /
- * ward staff accounts on an intranet app).
+ * Backup / emergency accounts configured in env (Provider ID SSO and access
+ * codes are the normal sign-in; these keep working when SSO is down or not
+ * registered yet): a handful of refer / ward staff accounts in env, no user
+ * table.
  *
  *   WAIT_USERS=alice:staff:scrypt.16384.8.1.<salt>.<key>,rc_phitsanulok:partner:scrypt...
  *
  * Entries are comma separated, fields colon separated:
  *   username  [a-z0-9_.-]{2,32} (case-insensitive, stored lower-case)
- *   role      "staff" | "partner"
+ *   role      "admin" | "staff" | "partner" (admin = staff + /admin pages)
  *   hash      scrypt.<N>.<r>.<p>.<salt base64url>.<key base64url>
  * Generate a hash with `node scripts/hash-password.mjs` (reads the
  * password from stdin). The format contains no "$", so Next's env
  * expansion cannot mangle it.
  */
 
-export type Role = "staff" | "partner";
+import { ROLES, type Role } from "./roles";
+
+export type { Role };
 
 export interface StaffUser {
   username: string;
@@ -42,7 +46,7 @@ function parseEntry(raw: string): UserEntry | null {
   if (rest.length > 0 || !username || !role || !hash) return null;
   const name = username.toLowerCase();
   if (!USERNAME_RE.test(name)) return null;
-  if (role !== "staff" && role !== "partner") return null;
+  if (!(ROLES as readonly string[]).includes(role)) return null;
   const parts = hash.split(".");
   if (parts.length !== 6 || parts[0] !== "scrypt") return null;
   const [N, r, p] = parts.slice(1, 4).map(Number);
@@ -54,7 +58,7 @@ function parseEntry(raw: string): UserEntry | null {
   if (keyBuf.length < 32) return null;
   return {
     username: name,
-    role,
+    role: role as Role,
     fingerprint: createHash("sha256").update(hash).digest("base64url").slice(0, 12),
     N,
     r,

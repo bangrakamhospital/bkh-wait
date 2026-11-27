@@ -109,10 +109,10 @@ shows data only after one successful sync (`SYNC_NOT_READY` before).
 
 SQL research against HOSxP only through `node .claude/skills/db-cli/scripts/query.mjs`.
 
-Staff account for `WAIT_USERS`:
+Backup account for `WAIT_USERS` (role `admin`, `staff` or `partner`):
 
 ```bash
-node scripts/hash-password.mjs alice staff      # prompts for the password
+node scripts/hash-password.mjs alice admin      # prompts for the password
 ```
 
 Central API key for `WAIT_API_KEYS` (prints the key once + the hash entry):
@@ -120,6 +120,41 @@ Central API key for `WAIT_API_KEYS` (prints the key once + the hash entry):
 ```bash
 node scripts/make-api-key.mjs moph-region3
 ```
+
+## Sign-in and user management (same as bkh-kpi :82)
+
+`/login` offers, in this order:
+
+1. **เข้าสู่ระบบด้วย Provider ID** — PLK Health ID / MOPH Provider ID
+   (OIDC via Auth.js). Shown only when `AUTH_PLKHEALTH_ISSUER`, `_ID`,
+   `_SECRET` and `_REDIRECT_URI` (path `/auth/callback`) are set.
+   `AUTH_PLKHEALTH_ALLOWED_ORGS` must list the allowed hospcodes — empty
+   denies every SSO sign-in. A first sign-in creates a **pending** row in
+   `wait.app_user`; an admin approves / rejects it or grants admin at
+   `/admin/users`. `AUTH_ADMIN_SUBS` subs are always approved admins.
+2. **รหัสสำหรับบุคคลภายนอก** — per-person code issued by an admin at
+   `/admin/access-codes` (name, organisation, expiry default 7 days, max
+   90). The code is shown once; only an HMAC (`WAIT_ACCESS_CODE_SECRET`) is
+   stored in `wait.access_code`. Revoking keeps the record. A code session
+   is role `partner`: boards + own refer-back requests, never HN.
+3. **บัญชีสำรอง** (collapsed) — `WAIT_USERS` username / password, for when
+   SSO is not available. Keep one `admin` entry here until Provider ID works
+   on :84, so someone can approve users and issue codes.
+
+Every request re-reads the user / code store, so approvals, role changes
+and revocations apply immediately; sessions last at most 8 h. HN views
+(`/api/beds/occupants`, staff / admin only) are audited with an actor that
+names the person (`sso:<sub>:<name>`, `local:<user>`). Logins and admin
+actions are in `wait.audit_log` (`action LIKE 'auth.%'`, `user.update`,
+`access_code.%`).
+
+**Before Provider ID works on :84** the IdP must accept the redirect URI
+`https://10.10.10.159:84/auth/callback` for the client in
+`AUTH_PLKHEALTH_ID` (ask the PLK Health ID / Provider ID administrators to
+register it, or issue a separate client and put its id / secret in
+`/var/www/wait/.env`). Until then the button fails at the IdP; use the
+backup account or access codes. Cookies are app specific
+(`bkh-wait.*`), so being signed in to bkh-kpi on :82 does not interfere.
 
 ## Production (server 10.10.10.159, mirrors bkh-kpi on :82)
 
@@ -143,12 +178,26 @@ bash scripts/server-upgrade.sh
 ```
 
 `scripts/server-upgrade.sh` (as bkhadmin, no sudo, safe to re-run): git
-reset to origin/main, npm ci, preflight dry run of both workers, pending
-migrations (005 OPD, 006 bed slots / occupants, ...), one bed sync,
+reset to origin/main, auth settings in `.env` (copies `AUTH_PLKHEALTH_ISSUER`
+/ `_ID` / `_SECRET` / `_ALLOWED_ORGS` and `AUTH_ADMIN_SUBS` from
+`/var/www/kpi/.env` when missing, sets `AUTH_PLKHEALTH_REDIRECT_URI` to
+`https://10.10.10.159:84/auth/callback` when missing, generates
+`AUTH_SECRET` / `WAIT_ACCESS_CODE_SECRET` when missing; never prints
+values), npm ci, preflight dry run of both workers, pending
+migrations (005 OPD, 006 bed slots / occupants, 007 sign-in, ...), one bed sync,
 build, pm2 restart, first OPD sync with 30 days backfill when OPD is new,
 adds the bed / OPD cron lines if missing, then checks `/api/board` has
 `bedSlots` and `/api/beds/occupants` answers 401 without login.
 `scripts/server-upgrade-opd.sh` is now a wrapper around it.
+
+Upgrade notes for 007 (sign-in like bkh-kpi):
+- Additive: tables `app_user`, `access_code` (app role: no DELETE).
+- Everybody signs in again once (new Auth.js cookie; the old
+  `bkh_wait_session` cookie is ignored). Existing `WAIT_USERS` keep
+  working as the backup login; refer requests they created stay "mine".
+- After the upgrade: sign in with a `WAIT_USERS` admin (or an
+  `AUTH_ADMIN_SUBS` Provider ID account once the :84 redirect URI is
+  registered) and approve staff at `/admin/users`.
 
 Upgrade notes for 006 (bed HN):
 - Additive: new tables `bed_slot`, `bed_occupant`, function
@@ -163,7 +212,7 @@ Upgrade notes for 006 (bed HN):
 
 | file | used by | holds |
 |---|---|---|
-| `.env` | web app (Next reads it), `db:migrate` | `WAIT_DATABASE_URL` (role `bkh_wait_app`), `WAIT_MIGRATE_DATABASE_URL` (owner), `WAIT_SESSION_SECRET`, `WAIT_USERS`, `WAIT_API_KEYS`, `WAIT_API_CORS_ORIGINS`, `WAIT_COOKIE_INSECURE` |
+| `.env` | web app (Next reads it), `db:migrate` | `WAIT_DATABASE_URL` (role `bkh_wait_app`), `WAIT_MIGRATE_DATABASE_URL` (owner), `AUTH_SECRET` (or older `WAIT_SESSION_SECRET`), `WAIT_ACCESS_CODE_SECRET`, `AUTH_PLKHEALTH_*`, `AUTH_ADMIN_SUBS`, `AUTH_BOOTSTRAP_ADMIN_FNAMES`, `WAIT_USERS`, `WAIT_API_KEYS`, `WAIT_API_CORS_ORIGINS`, `AUTH_COOKIE_INSECURE` |
 | `.env.sync` | sync worker only | `HIS_HOST/PORT/USER/PASSWORD/DATABASE`, `WAIT_SYNC_DATABASE_URL` (role `bkh_wait_sync`) |
 
 ### Sync workers (beds every 15 min, OPD every 5 min 06:00-20:55)

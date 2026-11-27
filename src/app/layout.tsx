@@ -2,6 +2,7 @@ import type { Metadata } from "next";
 import { Sarabun } from "next/font/google";
 import Link from "next/link";
 import { BedDouble, ClipboardList, Stethoscope } from "lucide-react";
+import { HeaderAuth } from "@/components/auth/HeaderAuth";
 import "./globals.css";
 
 const sarabun = Sarabun({
@@ -28,17 +29,20 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
             <div className="text-base font-semibold">
               ระบบบริหารเตียงและการรอคอย โรงพยาบาลบางระกำ
             </div>
-            <nav className="flex flex-wrap gap-1">
-              <Link href="/" className={navLink}>
-                <BedDouble size={16} aria-hidden /> เตียงผู้ป่วยใน
-              </Link>
-              <Link href="/opd" className={navLink}>
-                <Stethoscope size={16} aria-hidden /> รอพบแพทย์ OPD
-              </Link>
-              <Link href="/refer" className={navLink}>
-                <ClipboardList size={16} aria-hidden /> ส่งตัวกลับ
-              </Link>
-            </nav>
+            <div className="flex flex-wrap items-center gap-2">
+              <nav className="flex flex-wrap gap-1">
+                <Link href="/" className={navLink}>
+                  <BedDouble size={16} aria-hidden /> เตียงผู้ป่วยใน
+                </Link>
+                <Link href="/opd" className={navLink}>
+                  <Stethoscope size={16} aria-hidden /> รอพบแพทย์ OPD
+                </Link>
+                <Link href="/refer" className={navLink}>
+                  <ClipboardList size={16} aria-hidden /> ส่งตัวกลับ
+                </Link>
+              </nav>
+              <HeaderAuth />
+            </div>
           </div>
         </header>
         <main className="mx-auto max-w-7xl space-y-4 px-4 py-4">{children}</main>

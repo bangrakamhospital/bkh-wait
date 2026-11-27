@@ -2,7 +2,9 @@
 
 import Link from "next/link";
 import { useCallback, useEffect, useState } from "react";
+import { signOut } from "next-auth/react";
 import { LogOut, Plus } from "lucide-react";
+import { ROLE_LABEL, SESSION_CHANGED_EVENT, type Role, type SessionInfo } from "@/lib/auth/roles";
 import type { BedBoard, ReferBackRequest, ReferStatus } from "@/lib/beds/types";
 import { fmtDateTime, fmtNum, fmtWait, type Tone } from "./format";
 import {
@@ -16,7 +18,7 @@ import {
   inputClass,
 } from "./ui";
 
-type SessionUser = { username: string; role: "staff" | "partner" };
+type SessionUser = SessionInfo;
 type WardOption = { wardCode: string; wardName: string };
 type ApiError = { error?: string; code?: string };
 
@@ -125,9 +127,11 @@ export function ReferQueue() {
   }
 
   async function logout() {
-    await fetch("/api/logout", { method: "POST" });
+    await signOut({ redirect: false }).catch(() => undefined);
     setUser(null);
     setRequests(null);
+    // Tell the header (HeaderAuth) to re-read the session.
+    window.dispatchEvent(new Event(SESSION_CHANGED_EVENT));
   }
 
   if (user === undefined) return <LoadingState />;
@@ -140,7 +144,7 @@ export function ReferQueue() {
       <Card>
         <div className="space-y-3 py-6 text-center text-sm">
           <div>กรุณาเข้าสู่ระบบเพื่อดูและบันทึกคิวส่งกลับผู้ป่วย</div>
-          <Link href="/login" className={buttonClass}>
+          <Link href="/login?next=/refer" className={buttonClass}>
             เข้าสู่ระบบ
           </Link>
         </div>
@@ -154,7 +158,7 @@ export function ReferQueue() {
     <div className="space-y-4">
       <div className="flex flex-wrap items-center justify-between gap-2">
         <div className="text-sm">
-          ผู้ใช้: {user.username} ({user.role === "staff" ? "เจ้าหน้าที่โรงพยาบาลบางระกำ" : "โรงพยาบาลแม่ข่าย"})
+          ผู้ใช้: {user.name} ({ROLE_LABEL[user.role]})
         </div>
         <div className="flex gap-2">
           <button type="button" className={buttonClass} onClick={() => setShowForm((v) => !v)}>
@@ -268,7 +272,7 @@ function RowActions({
   onChange,
 }: {
   request: ReferBackRequest;
-  role: "staff" | "partner";
+  role: Role;
   busy: boolean;
   onChange: (id: number, next: ReferStatus) => void;
 }) {
@@ -276,17 +280,17 @@ function RowActions({
   if (status === "admitted" || status === "cancelled") return <span className="text-slate-400">-</span>;
   return (
     <div className="flex flex-wrap gap-1">
-      {role === "staff" && status === "waiting" ? (
+      {role !== "partner" && status === "waiting" ? (
         <button type="button" className={buttonClass} disabled={busy} onClick={() => onChange(id, "accepted")}>
           รับเคส
         </button>
       ) : null}
-      {role === "staff" && status === "accepted" ? (
+      {role !== "partner" && status === "accepted" ? (
         <button type="button" className={buttonClass} disabled={busy} onClick={() => onChange(id, "admitted")}>
           รับเข้าแล้ว
         </button>
       ) : null}
-      {role === "staff" || mine ? (
+      {role !== "partner" || mine ? (
         <button
           type="button"
           className={buttonGhostClass}

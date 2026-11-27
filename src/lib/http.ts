@@ -1,7 +1,7 @@
 import "server-only";
 
-import { getSession, type Session } from "./auth/session";
-import type { Role } from "./auth/users";
+import { getSession, SessionStoreUnavailable, type Session } from "./auth/session";
+import type { Role } from "./auth/roles";
 import { WaitDbConfigError, WaitDbError } from "./db/pg";
 
 /**
@@ -19,6 +19,8 @@ export type ErrorCode =
   | "UNSUPPORTED_MEDIA_TYPE"
   | "TOO_MANY_ATTEMPTS"
   | "AUTH_NOT_CONFIGURED"
+  | "AUTH_STORE_UNAVAILABLE"
+  | "CONFLICT"
   | "WAIT_DB_NOT_CONFIGURED"
   | "SYNC_NOT_READY"
   | "API_NOT_CONFIGURED"
@@ -54,6 +56,12 @@ export function json(
 export function errorResponse(err: unknown, label: string): Response {
   if (err instanceof ApiError) {
     return json({ error: err.message, code: err.code }, err.status, err.headers);
+  }
+  if (err instanceof SessionStoreUnavailable) {
+    return json(
+      { error: "ไม่สามารถตรวจสอบสิทธิ์ผู้ใช้ได้ในขณะนี้ กรุณาลองใหม่", code: "AUTH_STORE_UNAVAILABLE" },
+      503,
+    );
   }
   if (err instanceof WaitDbConfigError) {
     return json(
@@ -156,6 +164,14 @@ export async function requireSession(roles?: readonly Role[]): Promise<Session> 
 export function clientIp(headers: Headers): string {
   const first = headers.get("x-forwarded-for")?.split(",")[0]?.trim();
   return (first || headers.get("x-real-ip")?.trim() || "unknown").slice(0, 64);
+}
+
+/** requireSession(["admin"]) with the admin-only message. */
+export async function requireAdmin(): Promise<Session> {
+  const session = await getSession();
+  if (!session) throw new ApiError(401, "UNAUTHENTICATED", "กรุณาเข้าสู่ระบบ");
+  if (session.role !== "admin") throw new ApiError(403, "FORBIDDEN", "เฉพาะผู้ดูแลระบบเท่านั้น");
+  return session;
 }
 
 /** Parses an optional integer query parameter within [min, max]. */

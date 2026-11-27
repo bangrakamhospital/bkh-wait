@@ -12,6 +12,11 @@
 # Steps (each one checked; safe to re-run):
 #    1. git fetch + reset --hard origin/main, then re-run the NEW copy of
 #       this script (--no-fetch)
+#    -  auth settings in .env (idempotent, values never printed): copy
+#       AUTH_PLKHEALTH_ISSUER / ID / SECRET / ALLOWED_ORGS and AUTH_ADMIN_SUBS
+#       from /var/www/kpi/.env when missing, set AUTH_PLKHEALTH_REDIRECT_URI=
+#       https://10.10.10.159:84/auth/callback when missing, generate
+#       AUTH_SECRET and WAIT_ACCESS_CODE_SECRET when missing
 #    2. npm ci
 #    3. preflight: both workers read HOSxP with .env.sync (--dry-run, no writes)
 #    4. migrations (npm run db:migrate; no-op when up to date)
@@ -57,6 +62,63 @@ ensure_cron() {
   echo "    cron: $marker added"
 }
 
+# --- auth settings in .env (Provider ID SSO, access codes) -------------------
+# Idempotent: only keys that are missing or empty are written; existing
+# values are never changed. Values are never printed.
+KPI_ENV=/var/www/kpi/.env
+WAIT_REDIRECT_URI=https://10.10.10.159:84/auth/callback
+
+env_has() { grep -qE "^$1=.+" .env; }
+
+# Appends KEY=VALUE (dropping an empty "KEY=" line first).
+env_put() {
+  sed -i "/^$1=[[:space:]]*\$/d" .env || return 1
+  printf '%s=%s\n' "$1" "$2" >> .env || return 1
+  echo "    .env: $1 added"
+}
+
+# Raw value of KEY in bkh-kpi's .env (last occurrence), empty if none.
+kpi_value() {
+  [ -r "$KPI_ENV" ] || return 0
+  grep -E "^$1=" "$KPI_ENV" | tail -n 1 | cut -d= -f2-
+}
+
+copy_from_kpi() {
+  local key="$1" value
+  if env_has "$key"; then echo "    .env: $key already set"; return 0; fi
+  value="$(kpi_value "$key")"
+  if [ -z "$value" ]; then
+    echo "    .env: $key missing here and in $KPI_ENV - set it by hand if needed"
+    return 0
+  fi
+  env_put "$key" "$value"
+}
+
+new_secret() { node -e "console.log(require('crypto').randomBytes(32).toString('base64url'))"; }
+
+ensure_auth_env() {
+  [ -r "$KPI_ENV" ] || echo "    note: $KPI_ENV not readable - Provider ID settings cannot be copied"
+  copy_from_kpi AUTH_PLKHEALTH_ISSUER || return 1
+  copy_from_kpi AUTH_PLKHEALTH_ID || return 1
+  copy_from_kpi AUTH_PLKHEALTH_SECRET || return 1
+  copy_from_kpi AUTH_PLKHEALTH_ALLOWED_ORGS || return 1
+  copy_from_kpi AUTH_ADMIN_SUBS || return 1
+  if env_has AUTH_PLKHEALTH_REDIRECT_URI; then
+    echo "    .env: AUTH_PLKHEALTH_REDIRECT_URI already set"
+  else
+    env_put AUTH_PLKHEALTH_REDIRECT_URI "$WAIT_REDIRECT_URI" || return 1
+  fi
+  # bkh-wait's own secrets: never shared with bkh-kpi.
+  local key value
+  for key in AUTH_SECRET WAIT_ACCESS_CODE_SECRET; do
+    if env_has "$key"; then echo "    .env: $key already set"; continue; fi
+    value="$(new_secret)" || return 1
+    [ "${#value}" -ge 32 ] || return 1
+    env_put "$key" "$value" || return 1
+  done
+  chmod 600 .env || return 1
+}
+
 # Everything lives in main(): bash has parsed the whole file before step 1
 # rewrites it with git reset.
 main() {
@@ -78,6 +140,9 @@ main() {
     || fail "check: HIS_* incomplete in .env.sync"
   grep -qE '^WAIT_SYNC_DATABASE_URL=.+' .env.sync || fail "check: WAIT_SYNC_DATABASE_URL missing in .env.sync"
   mkdir -p "$LOG_DIR" || fail "check: mkdir $LOG_DIR"
+
+  echo "==> auth settings (.env)"
+  ensure_auth_env || fail "auth settings in .env"
 
   echo "==> 2/10 npm packages"
   npm ci --no-audit --no-fund || fail "2/10 npm ci"

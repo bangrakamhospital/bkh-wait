@@ -101,3 +101,26 @@ export function hitRequestLimit(key: string, max: number, windowMs: number, now 
   b.count += 1;
   return b.count > max ? Math.ceil((b.resetAt - now) / 1000) : 0;
 }
+
+/**
+ * Access-code login limiter (separate keys in the login buckets): 5 failed
+ * codes / 5 minutes per IP (like bkh-kpi). Codes carry 80 bits from the
+ * CSPRNG, so guessing is hopeless anyway; there is deliberately no global
+ * limit (it would let one client lock every outsider out). A success clears
+ * the IP key.
+ */
+const MAX_CODE_PER_IP = 5;
+
+export function accessCodeRetryAfter(ip: string, now = Date.now()): number {
+  const b = active(`c|${ip}`, now);
+  return b && b.count >= MAX_CODE_PER_IP ? Math.ceil((b.resetAt - now) / 1000) : 0;
+}
+
+export function recordAccessCodeFailure(ip: string, now = Date.now()) {
+  if (buckets.size > MAX_KEYS) prune(now);
+  bump(`c|${ip}`, now);
+}
+
+export function recordAccessCodeSuccess(ip: string) {
+  buckets.delete(`c|${ip}`);
+}
