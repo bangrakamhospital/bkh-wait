@@ -1,22 +1,11 @@
 import { Info, Users } from "lucide-react";
-import { FLOW_DEFS } from "@/lib/opd/flow";
+import { FLOW_COLOR, FLOW_DEFS } from "@/lib/opd/flow";
 import type { OpdFlow, OpdFlowKey } from "@/lib/opd/types";
 import { fmtDateTime, fmtNum, fmtPct } from "../format";
 import { Card, EmptyState } from "../ui";
 
-/** One fixed color per bucket: tile dot, stacked bar and legend match. */
-const bucketColor: Record<OpdFlowKey, string> = {
-  screening: "bg-amber-400",
-  doctor: "bg-orange-500",
-  after_doctor: "bg-brand-500",
-  lab: "bg-sky-500",
-  services: "bg-violet-500",
-  pharmacy: "bg-teal-600",
-  done: "bg-emerald-500",
-  er: "bg-red-500",
-  admit: "bg-rose-400",
-  other: "bg-slate-400",
-};
+/** One fixed color per bucket: tile dot, stacked bar, legend and the 3D scene match. */
+const bucketColor = (key: OpdFlowKey): string => FLOW_COLOR[key].bg;
 
 const definitionOf = new Map(FLOW_DEFS.map((d) => [d.key, d.definition]));
 
@@ -57,7 +46,7 @@ export function OpdFlowSection({ flow }: { flow: OpdFlow | null }) {
             .map((b) => (
               <div
                 key={b.key}
-                className={bucketColor[b.key]}
+                className={bucketColor(b.key)}
                 style={{ width: `${pct(b.count)}%` }}
                 title={`${b.label} ${fmtNum(b.count)} (${fmtPct(pct(b.count))})`}
               />
@@ -68,7 +57,7 @@ export function OpdFlowSection({ flow }: { flow: OpdFlow | null }) {
           {flow.buckets.map((b) => (
             <div key={b.key} className="rounded-lg border border-brand-100 p-3" title={definitionOf.get(b.key)}>
               <div className="flex items-center gap-1.5 text-sm text-slate-600">
-                <span className={`inline-block h-2.5 w-2.5 shrink-0 rounded-sm ${bucketColor[b.key]}`} aria-hidden />
+                <span className={`inline-block h-2.5 w-2.5 shrink-0 rounded-sm ${bucketColor(b.key)}`} aria-hidden />
                 {b.label}
               </div>
               <div className="mt-1 text-2xl font-bold tabular-nums">
@@ -87,7 +76,7 @@ export function OpdFlowSection({ flow }: { flow: OpdFlow | null }) {
           <ul className="mt-2 space-y-1">
             {FLOW_DEFS.map((d) => (
               <li key={d.key} className="flex gap-1.5">
-                <span className={`mt-1 inline-block h-2 w-2 shrink-0 rounded-sm ${bucketColor[d.key]}`} aria-hidden />
+                <span className={`mt-1 inline-block h-2 w-2 shrink-0 rounded-sm ${bucketColor(d.key)}`} aria-hidden />
                 <span>
                   <span className="font-medium">{d.label}</span>: {d.definition}
                 </span>

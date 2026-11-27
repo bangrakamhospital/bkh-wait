@@ -49,8 +49,8 @@ export function OpdView({ board }: { board: OpdBoard }) {
 
       <OpdClinicTable clinics={board.clinics} totals={t} />
 
-      <Card title="ห้องตรวจผู้ป่วยนอกแบบ 3 มิติ">
-        <OpdSceneLoader clinics={board.clinics} />
+      <Card title="จุดที่ผู้ป่วยนั่งรอ (แบบ 3 มิติ)">
+        <OpdSceneLoader flow={board.flow} clinics={board.clinics} />
       </Card>
 
       <OpdHourlyChart points={board.hourly} />
