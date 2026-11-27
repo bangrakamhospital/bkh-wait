@@ -16,8 +16,7 @@
 #       AUTH_PLKHEALTH_ISSUER / ID / SECRET / ALLOWED_ORGS and AUTH_ADMIN_SUBS
 #       from /var/www/kpi/.env when missing, set AUTH_PLKHEALTH_REDIRECT_URI=
 #       https://10.10.10.159:84/auth/callback when missing, generate
-#       AUTH_SECRET and WAIT_ACCESS_CODE_SECRET when missing; create a backup
-#       "admin" login in WAIT_USERS when none exists (password printed once)
+#       AUTH_SECRET and WAIT_ACCESS_CODE_SECRET when missing
 #    2. npm ci
 #    3. preflight: both workers read HOSxP with .env.sync (--dry-run, no writes)
 #    4. migrations (npm run db:migrate; no-op when up to date)
@@ -118,25 +117,9 @@ ensure_auth_env() {
     [ "${#value}" -ge 32 ] || return 1
     env_put "$key" "$value" || return 1
   done
-  # Backup admin account (approves Provider ID users, issues access codes)
-  # so the admin pages are usable before Provider ID works on :84.
-  # Created once; the password is printed ONCE.
-  if ! grep -E "^WAIT_USERS=" .env | tail -n 1 | grep -qE "(=|,)[^:,]+:admin:"; then
-    local pw entry current
-    pw="$(new_secret | tr -dc "A-Za-z0-9" | head -c 14)"
-    [ "${#pw}" -ge 12 ] || return 1
-    entry="$(printf "%s" "$pw" | node scripts/hash-password.mjs admin admin)" || return 1
-    case "$entry" in admin:admin:scrypt*) ;; *) return 1 ;; esac
-    current="$(grep -E "^WAIT_USERS=" .env | tail -n 1 | cut -d= -f2-)"
-    sed -i "/^WAIT_USERS=/d" .env || return 1
-    printf "WAIT_USERS=%s\n" "${current:+$current,}$entry" >> .env || return 1
-    echo
-    echo "    *** backup admin login (shown once, write it down) ***"
-    echo "    username: admin"
-    echo "    password: $pw"
-    echo
-    unset pw entry
-  fi
+  # No WAIT_USERS backup login is created: sign-in is Provider ID (admins
+  # approved in /admin/users) and access codes for outsiders. An empty
+  # WAIT_USERS hides the username/password form.
   chmod 600 .env || return 1
 }
 
