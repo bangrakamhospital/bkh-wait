@@ -76,7 +76,7 @@ function OccupantBlock({ bed, state }: { bed: PickedBed; state: OccupantState })
     case "guest":
       return (
         <div className={box}>
-          <a href="/login?next=/" className="font-medium text-brand-700 underline">
+          <a href="/login?next=/beds" className="font-medium text-brand-700 underline">
             เข้าสู่ระบบเจ้าหน้าที่เพื่อดู HN
           </a>
         </div>

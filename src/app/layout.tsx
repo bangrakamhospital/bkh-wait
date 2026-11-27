@@ -31,11 +31,11 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
             </div>
             <div className="flex flex-wrap items-center gap-2">
               <nav className="flex flex-wrap gap-1">
-                <Link href="/" className={navLink}>
-                  <BedDouble size={16} aria-hidden /> เตียงผู้ป่วยใน
-                </Link>
                 <Link href="/opd" className={navLink}>
                   <Stethoscope size={16} aria-hidden /> รอพบแพทย์ OPD
+                </Link>
+                <Link href="/beds" className={navLink}>
+                  <BedDouble size={16} aria-hidden /> เตียงผู้ป่วยใน
                 </Link>
                 <Link href="/refer" className={navLink}>
                   <ClipboardList size={16} aria-hidden /> ส่งตัวกลับ
