@@ -24,7 +24,8 @@ import {
 import { buttonGhostClass, toneBadge } from "../ui";
 import { OpdGrid2D } from "./OpdGrid2D";
 
-const COLS = 3;
+/** Fewest room columns; more for many clinics so the hall matches a wide screen. */
+const MIN_COLS = 3;
 const CELL_W = 12.5;
 const ROOM_W = 7.5;
 const ROOM_D = 3.6;
@@ -69,21 +70,36 @@ function clinicMinutes(c: ClinicWait): number {
 }
 
 type Cell = { clinic: ClinicWait; cx: number; cz: number; shown: number; tone: Tone };
-type Hall = { cells: Cell[]; width: number; depth: number; screenZ: number };
+type Hall = { cells: Cell[]; width: number; depth: number; screenZ: number; rows: number; activeRows: number };
 
-function layoutHall(clinics: ClinicWait[]): Hall {
-  const cols = Math.max(1, Math.min(COLS, clinics.length));
-  const rows = Math.max(1, Math.ceil(clinics.length / COLS));
+/** Clinic with patients today (waiting or seen). */
+const isActive = (c: ClinicWait) => c.waitingNow > 0 || c.seenToday > 0;
+
+/** Display name for the 3D pill: HOSxP names carry notes in brackets, e.g. "(รอพบแพทย์ ห้ามนัด)". */
+function shortName(name: string): string {
+  const s = name.replace(/\s*[(（][^)）]*[)）]/g, "").trim();
+  return s || name;
+}
+
+function layoutHall(input: ClinicWait[]): Hall {
+  // Active clinics first (stable: keeps HOSxP order within each group) so the
+  // opening view can sit on the rows that matter.
+  const clinics = [...input.filter(isActive), ...input.filter((c) => !isActive(c))];
+  const n = clinics.length;
+  const perRow = Math.max(1, Math.min(n, Math.max(MIN_COLS, Math.round(Math.sqrt(n * 1.8)))));
+  const cols = perRow;
+  const rows = Math.max(1, Math.ceil(n / perRow));
+  const activeRows = Math.ceil(input.filter(isActive).length / perRow);
   const width = cols * CELL_W;
   const depth = rows * CELL_D + SCREEN_D;
   const cells = clinics.map((clinic, i) => ({
     clinic,
-    cx: ((i % COLS) - (cols - 1) / 2) * CELL_W,
-    cz: -depth / 2 + Math.floor(i / COLS) * CELL_D + CELL_D / 2,
+    cx: ((i % perRow) - (cols - 1) / 2) * CELL_W,
+    cz: -depth / 2 + Math.floor(i / perRow) * CELL_D + CELL_D / 2,
     shown: Math.min(clinic.waitingNow, MAX_SHOWN),
     tone: waitTone(clinicMinutes(clinic)),
   }));
-  return { cells, width, depth, screenZ: depth / 2 - SCREEN_D / 2 };
+  return { cells, width, depth, screenZ: depth / 2 - SCREEN_D / 2, rows, activeRows };
 }
 
 /** Local (to the cell) position of queue slot j; slot 0 is right at the room door. */
@@ -444,8 +460,8 @@ function ClinicRoom({ cell, anim }: { cell: Cell; anim: boolean }) {
       <Chair x={0} z={deskZ + 0.95} />
       {/* Clinic pill: screen-aligned, never rotates. Always portal into the canvas box. */}
       <Html portal={portal} position={[0, 2.6, ROOM_BACK - 0.5]} center zIndexRange={[5, 0]} pointerEvents="none">
-        <div className="whitespace-nowrap rounded-md bg-white/95 px-2 py-1 text-center text-xs shadow">
-          <div className="font-semibold">{c.clinicName}</div>
+        <div className="max-w-[13rem] whitespace-nowrap rounded-md bg-white/95 px-2 py-1 text-center text-xs shadow">
+          <div className="truncate font-semibold">{shortName(c.clinicName)}</div>
           <div className="mt-0.5 flex items-center justify-center gap-1">
             <span>
               รอ {fmtNum(c.waitingNow)} คน{over > 0 ? ` (+${fmtNum(over)})` : ""}
@@ -577,10 +593,16 @@ export default function OpdScene({ clinics }: { clinics: ClinicWait[] }) {
   const [resetN, setResetN] = useState(0);
   const nav = useNavHold();
   useNavKeys(box, nav);
-  const goal = useMemo<Goal>(
-    () => ({ key: `${hall.width}x${hall.depth}:${resetN}`, cx: 0, cz: hall.depth * 0.07, w: hall.width, d: hall.depth * 0.95, margin: 1 }),
-    [hall.width, hall.depth, resetN],
-  );
+  // Opening view: the rows with patients today (closer, readable labels);
+  // the whole hall when every row is busy. Zoom out / pan for the rest.
+  const goal = useMemo<Goal>(() => {
+    const key = `${hall.width}x${hall.depth}:${hall.activeRows}:${resetN}`;
+    if (hall.activeRows > 0 && hall.activeRows < hall.rows) {
+      const d = hall.activeRows * CELL_D;
+      return { key, cx: 0, cz: -hall.depth / 2 + d / 2, w: hall.width, d, margin: 1 };
+    }
+    return { key, cx: 0, cz: hall.depth * 0.07, w: hall.width, d: hall.depth * 0.95, margin: 1 };
+  }, [hall.width, hall.depth, hall.rows, hall.activeRows, resetN]);
 
   // Stop rendering while the canvas is scrolled out of view.
   useEffect(() => {
