@@ -29,7 +29,8 @@
 #    9. cron: add the bed line (every 15 min) and the OPD line (every 5 min
 #       06:00-20:55) if missing; existing lines are left as they are
 #   10. check GET /api/board (bedSlots present) and that
-#       GET /api/beds/occupants answers 401 without a login
+#       GET /api/beds/occupants and GET /api/opd/waiters answer 401
+#       without a login
 # No `set -e` / pipefail: crontab -l on an empty crontab and grep without a
 # match return non-zero; every step checks its own result instead.
 # Never prints passwords, connection strings or patient data (the workers
@@ -232,6 +233,9 @@ main() {
   CODE="$(curl -sk -o /dev/null -w '%{http_code}' --max-time 5 'https://127.0.0.1:84/api/beds/occupants?ward=01')"
   [ "$CODE" = 401 ] || fail "10/10 /api/beds/occupants without login answered $CODE (expected 401)"
   echo "    /api/beds/occupants without login: 401 ok"
+  CODE="$(curl -sk -o /dev/null -w '%{http_code}' --max-time 5 'https://127.0.0.1:84/api/opd/waiters?clinic=001')"
+  [ "$CODE" = 401 ] || fail "10/10 /api/opd/waiters without login answered $CODE (expected 401)"
+  echo "    /api/opd/waiters without login: 401 ok"
   echo "Done. Board: https://10.10.10.159:84/ ; logs: $LOG_DIR/sync.log $LOG_DIR/sync-opd.log"
 }
 

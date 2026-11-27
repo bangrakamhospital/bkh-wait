@@ -15,17 +15,27 @@ patients wait from registration to the doctor (การรอคอยการ
   (OPD waits, cron every 5 min 06:00-20:55), which have their own env file
   `.env.sync`. The web app has no HOSxP credentials.
 - API contract: [`docs/api.md`](docs/api.md); shared types: `src/lib/beds/types.ts`,
-  `src/lib/opd/types.ts`
+  `src/lib/opd/types.ts`, `src/lib/opd/waiter-types.ts` (restricted)
 
 Only aggregate counts leave the server (refer-back requests carry a case
-reference of the sending hospital, 13-digit IDs are rejected). The ONE
-patient identifier kept is the **HN per occupied bed** (`wait.bed_occupant`,
-db/006) for the 3D bed scene: staff tap a bed and see the HN. It is
-readable only by logged-in `staff` through `GET /api/beds/occupants`; the
-app's database role cannot SELECT the table and goes through the
-`SECURITY DEFINER` function `wait.bed_occupants_for_ward`, which writes an
-`audit_log` row (`view_hn`) for every view. Never in the public board or
-the central API. No AN, names or CID are stored anywhere.
+reference of the sending hospital, 13-digit IDs are rejected). The ONLY
+patient identifier kept is the **HN**, in two restricted tables, both with
+the same model:
+- **HN per occupied bed** (`wait.bed_occupant`, db/006) for the 3D bed
+  scene: staff tap a bed and see the HN (`GET /api/beds/occupants`,
+  function `wait.bed_occupants_for_ward`, audit action `view_hn`).
+- **HN + queue number of today's OPD waiters** (`wait.opd_waiter`, db/010)
+  for the /opd clinic table: staff click a clinic's waiting count or
+  longest wait and see who is waiting, longest first, where they are now
+  and whether lab / X-ray is pending (`GET /api/opd/waiters`, function
+  `wait.opd_waiters_for_clinic`, audit action `opd_waiter.view`).
+
+Both are written only by the sync workers (write-only for role
+`bkh_wait_sync`), readable only by logged-in `staff` / `admin`; the app's
+database role cannot SELECT the tables and goes through the `SECURITY
+DEFINER` function, which writes an `audit_log` row for every view. Never
+in the public board, the central API, logs or browser storage. No VN, AN,
+names, CID, address or phone are stored anywhere.
 
 ## Architecture
 
@@ -39,6 +49,8 @@ PostgreSQL bkh_wait.wait
    bed_slot                       physical beds + occupied flag (public)
    bed_occupant                   RESTRICTED: HN per occupied bed; app reads it only via
                                   bed_occupants_for_ward() (audited), sync role write-only
+   opd_waiter                     RESTRICTED: HN / queue no. of today's OPD waiters; app reads
+                                  it only via opd_waiters_for_clinic() (audited), sync write-only
    occupancy_snapshot             history, one row per ward per sync
    daily_census                   one row per (date, ward), finalized after midnight
    sync_run                       one row per run (job beds | opd, ok / error code)
@@ -56,6 +68,7 @@ Next.js web app (pm2, 127.0.0.1:3084, nginx :84)
    /api/beds/occupants            HN per bed, staff session only, audited
    /opd         OPD board (stale after 15 min during 06:15-20:30)
    /api/opd/board
+   /api/opd/waiters               HN of a clinic's OPD waiters, staff session only, audited
    /api/v1/census, /api/v1/beds/current, /api/v1/opd/current, /api/v1/opd/daily
                                           central API (Bearer key)
 ```
@@ -143,7 +156,7 @@ node scripts/make-api-key.mjs moph-region3
 
 Every request re-reads the user / code store, so approvals, role changes
 and revocations apply immediately; sessions last at most 8 h. HN views
-(`/api/beds/occupants`, staff / admin only) are audited with an actor that
+(`/api/beds/occupants`, `/api/opd/waiters`, staff / admin only) are audited with an actor that
 names the person (`sso:<sub>:<name>`, `local:<user>`). Logins and admin
 actions are in `wait.audit_log` (`action LIKE 'auth.%'`, `user.update`,
 `access_code.%`).
@@ -187,7 +200,7 @@ values), npm ci, preflight dry run of both workers, pending
 migrations (005 OPD, 006 bed slots / occupants, 007 sign-in, ...), one bed sync,
 build, pm2 restart, first OPD sync with 30 days backfill when OPD is new,
 adds the bed / OPD cron lines if missing, then checks `/api/board` has
-`bedSlots` and `/api/beds/occupants` answers 401 without login.
+`bedSlots` and `/api/beds/occupants` / `/api/opd/waiters` answer 401 without login.
 `scripts/server-upgrade-opd.sh` is now a wrapper around it.
 
 Upgrade notes for 007 (sign-in like bkh-kpi):
@@ -198,6 +211,18 @@ Upgrade notes for 007 (sign-in like bkh-kpi):
 - After the upgrade: sign in with a `WAIT_USERS` admin (or an
   `AUTH_ADMIN_SUBS` Provider ID account once the :84 redirect URI is
   registered) and approve staff at `/admin/users`.
+
+Upgrade notes for 010 (OPD waiters, HN):
+- Additive: new table `opd_waiter` and function `opd_waiters_for_clinic`
+  (sync role INSERT / DELETE only, app role EXECUTE only). The OPD worker
+  fills it on its next run (`server-upgrade.sh` migrates, then the cron).
+- **Backups:** from now on the PostgreSQL database (and its backups) also
+  holds the HN and queue number of **today's OPD waiters** (replaced every
+  5 min; the rows of the last evening run stay until the first morning
+  run, but are never shown for another day). Keep backups as protected as
+  HOSxP's.
+- Audit of waiter views:
+  `SELECT at, actor, entity_id AS clinic, detail->>'rows' AS rows FROM wait.audit_log WHERE action = 'opd_waiter.view' ORDER BY at DESC LIMIT 50;`
 
 Upgrade notes for 006 (bed HN):
 - Additive: new tables `bed_slot`, `bed_occupant`, function

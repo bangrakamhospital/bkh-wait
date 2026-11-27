@@ -24,15 +24,18 @@
 //      opd_route (when refreshed), sync_run (job 'opd'), opd_state
 //      (replaced), opd_hourly + opd_daily of today (replaced / upserted),
 //      opd_flow of today (replaced: where every visit of the day is now,
-//      the buckets sum to COUNT(*) FROM ovst), earlier open days
-//      recomputed and finalized
+//      the buckets sum to COUNT(*) FROM ovst), opd_waiter (RESTRICTED,
+//      replaced: HN + queue number of the visits waiting now, db/010 —
+//      write-only for this role, never printed or logged), earlier open
+//      days recomputed and finalized
 //   4. on failure: rollback, a sync_run row (job 'opd', ok = false, short
 //      error code only), exit code 1
 // Re-running is safe: every write is an upsert / replace.
 //
 // --dry-run: steps 1-2 without PostgreSQL (routes always read from HOSxP);
 //   prints what would be written, plus an independent COUNT(*) of ovst to
-//   cross-check the flow total. --date=YYYY-MM-DD: report that day as a
+//   cross-check the flow total and the waiter COUNTS per clinic against the
+//   board (never an HN). --date=YYYY-MM-DD: report that day as a
 //   closed day instead of today (verification; its flow = where that day's
 //   visits are now, by HOSxP's current cur_dep).
 // --backfill=N (1-92): also write finalized rows for the N days before
@@ -54,8 +57,10 @@ import {
   fetchRoutes,
   fetchVisitCount,
   fetchVisits,
+  fetchWaiterDetails,
   FLOW_BUCKETS,
   hisMs,
+  listWaiters,
   waitStats,
 } from "./lib/hosxp-opd.mjs";
 import { openPg, pgCode } from "./lib/pg-sync.mjs";
@@ -161,7 +166,77 @@ function summarize(h) {
   }));
   // The flow is always "now": cur_dep is HOSxP's current state (also for --date).
   const flow = classifyFlow(h.visits, clinicSet, route, hisMs(h.clock.now));
-  return { nowMs, clinicSet, today, closing, reseg, flow };
+  const waiters = nowMs === null ? [] : listWaiters(h.visits, clinicSet, route, nowMs);
+  return { nowMs, clinicSet, today, closing, reseg, flow, waiters };
+}
+
+/**
+ * RESTRICTED rows of wait.opd_waiter: listWaiters + fetchWaiterDetails
+ * (HN, queue no., lab / X-ray). Visits without an HN are dropped (counted
+ * in the dry-run report only). Never log or print these rows.
+ */
+function waiterRows(s, details, names) {
+  const rows = [];
+  for (const w of s.waiters) {
+    const d = details.get(w.vn);
+    if (!d) continue;
+    rows.push({
+      clinic: w.clinic,
+      hn: d.hn,
+      queueNo: d.oqueue,
+      stage: w.stage,
+      stale: w.stale,
+      registeredAt: new Date(w.regMs).toISOString(),
+      screenedAt: w.scrMs === null ? null : new Date(w.scrMs).toISOString(),
+      minReg: Math.max(0, w.minutesSinceRegistration),
+      minScr: w.minutesSinceScreening,
+      curDep: w.curDep,
+      curDepName: w.curDep ? (names.get(w.curDep) ?? `แผนก ${w.curDep}`).slice(0, 120) : null,
+      labPending: d.labPending,
+      xrayOrdered: d.xrayOrdered,
+    });
+  }
+  return rows;
+}
+
+const emptyWaiterCount = () => ({ waiters: 0, waitersForDoctor: 0, stale: 0, labPending: 0, xrayOrdered: 0, over180: 0, longestScreen: null });
+
+/** Waiter COUNTS per clinic vs the board (dry run; no HN, no VN). */
+function waiterReport(s, rows) {
+  const per = new Map();
+  for (const w of rows) {
+    const e = per.get(w.clinic) ?? emptyWaiterCount();
+    if (w.stale) e.stale += 1;
+    else {
+      e.waiters += 1;
+      if (w.stage === "doctor") e.waitersForDoctor += 1;
+      if (w.minScr !== null && w.minScr <= 480) e.longestScreen = Math.max(e.longestScreen ?? 0, w.minScr);
+    }
+    if (w.labPending) e.labPending += 1;
+    if (w.xrayOrdered) e.xrayOrdered += 1;
+    if ((w.minScr ?? w.minReg) > 180) e.over180 += 1;
+    per.set(w.clinic, e);
+  }
+  const clinics = s.today
+    .filter((r) => r.e.waitingNow > 0 || per.has(r.clinic))
+    .map((r) => {
+      const e = per.get(r.clinic) ?? emptyWaiterCount();
+      return {
+        clinic: r.clinic,
+        boardWaitingNow: r.e.waitingNow,
+        boardWaitingForDoctor: r.e.waitingForDoctor,
+        boardLongestScreenWait: r.e.longestScreenWait,
+        ...e,
+        match: e.waiters === r.e.waitingNow && e.waitersForDoctor === r.e.waitingForDoctor && e.longestScreen === r.e.longestScreenWait,
+      };
+    });
+  return {
+    listed: s.waiters.length,
+    withHn: rows.length,
+    missingHn: s.waiters.length - rows.length,
+    allMatch: clinics.every((c) => c.match),
+    clinics,
+  };
 }
 
 function dryRunReport(h, s) {
@@ -220,6 +295,7 @@ function dryRunReport(h, s) {
       boardWaitingNow: sum("waitingNow"),
       boardWaitingForDoctor: sum("waitingForDoctor"),
     },
+    waiters: waiterReport(s, h.waiterRows),
     hourly: Array.from({ length: 24 }, (_, hour) => {
       let arrived = 0, seen = 0, ws = 0, wn = 0, ss = 0, sn = 0;
       for (const r of s.today) {
@@ -462,6 +538,36 @@ async function writePg(client, h, s, startedAt) {
     ],
   );
 
+  // RESTRICTED (db/010): replace the waiters (earlier days go too).
+  await client.query("DELETE FROM opd_waiter");
+  const w = h.waiterRows;
+  await client.query(
+    `INSERT INTO opd_waiter (visit_date, clinic_code, hn, queue_no, stage, stale, registered_at, screened_at,
+                             minutes_since_registration, minutes_since_screening, cur_dep, cur_dep_name,
+                             lab_pending, xray_ordered, sync_run_id)
+     SELECT $1::date, x.c, x.hn, x.q, x.st, x.stale, x.reg, x.scr, x.mr, x.ms, x.dep, x.depn, x.lab, x.xr, $2::bigint
+       FROM unnest($3::text[], $4::text[], $5::int[], $6::text[], $7::boolean[], $8::timestamptz[], $9::timestamptz[],
+                   $10::int[], $11::int[], $12::text[], $13::text[], $14::boolean[], $15::boolean[])
+            AS x(c, hn, q, st, stale, reg, scr, mr, ms, dep, depn, lab, xr)`,
+    [
+      h.today,
+      run.id,
+      w.map((x) => x.clinic),
+      w.map((x) => x.hn),
+      w.map((x) => x.queueNo),
+      w.map((x) => x.stage),
+      w.map((x) => x.stale),
+      w.map((x) => x.registeredAt),
+      w.map((x) => x.screenedAt),
+      w.map((x) => x.minReg),
+      w.map((x) => x.minScr),
+      w.map((x) => x.curDep),
+      w.map((x) => x.curDepName),
+      w.map((x) => x.labPending),
+      w.map((x) => x.xrayOrdered),
+    ],
+  );
+
   await client.query("DELETE FROM opd_flow WHERE visit_date = $1", [h.today]);
   await client.query(
     `INSERT INTO opd_flow (visit_date, bucket, visits, sync_run_id, updated_at)
@@ -503,9 +609,12 @@ async function main() {
     stage = "his";
     his = await openHis();
     const h = await readHis(his, pgState);
+    const s = summarize(h);
+    // RESTRICTED: HN / queue no. of the visits waiting now (db/010)
+    const details = s.waiters.length ? await fetchWaiterDetails(his, s.waiters.map((x) => x.vn)) : new Map();
+    h.waiterRows = waiterRows(s, details, h.names);
     await his.close();
     his = null;
-    const s = summarize(h);
 
     if (dryRun) {
       console.log(JSON.stringify(dryRunReport(h, s), null, 2));
@@ -516,7 +625,7 @@ async function main() {
     const waiting = s.today.reduce((n, r) => n + r.e.waitingNow, 0);
     const seen = s.today.reduce((n, r) => n + r.seen, 0);
     console.log(
-      `${ts()} opd sync ok: run ${runId}, ${h.today}, ${s.clinicSet.size} clinic(s), waiting ${waiting}, seen ${seen}, visits ${s.flow.total}` +
+      `${ts()} opd sync ok: run ${runId}, ${h.today}, ${s.clinicSet.size} clinic(s), waiting ${waiting}, seen ${seen}, visits ${s.flow.total}, waiter rows ${h.waiterRows.length}` +
         (h.routesFresh ? ", routes refreshed" : "") +
         (h.closing.length ? `, finalized ${h.closing.map((c) => c.day).join(" ")}` : "") +
         (h.reseg.length ? `, resegmented ${h.reseg.length} day(s)` : "") +
