@@ -4,6 +4,9 @@ import { Badge, Card, EmptyState } from "../ui";
 
 const cell = "py-2 pr-3 text-right tabular-nums";
 
+/** Registered but not screened yet (OPD-SCREEN not done): waiting minus waiting-for-doctor. */
+const waitingScreen = (x: { waitingNow: number; waitingForDoctor: number }) => Math.max(0, x.waitingNow - x.waitingForDoctor);
+
 function WaitCell({ minutes }: { minutes: number | null }) {
   if (minutes === null) return <>-</>;
   return <Badge tone={waitTone(minutes)}>{fmtNum(Math.round(minutes))}</Badge>;
@@ -22,7 +25,8 @@ export function OpdClinicTable({ clinics, totals }: { clinics: ClinicWait[]; tot
               <tr>
                 <th className="py-2 pr-3 text-left">แผนก / คลินิก</th>
                 <th className={cell}>รอตอนนี้ (คน)</th>
-                <th className={cell}>รอหน้าห้องตรวจ</th>
+                <th className={cell}>รอคัดกรอง</th>
+                <th className={cell}>คัดกรองแล้ว รอหน้าห้องตรวจ</th>
                 <th className={cell}>ตรวจแล้ว</th>
                 <th className={cell}>รอเฉลี่ย</th>
                 <th className={cell}>มัธยฐาน</th>
@@ -37,6 +41,7 @@ export function OpdClinicTable({ clinics, totals }: { clinics: ClinicWait[]; tot
                 <tr key={c.clinicCode} className="border-b border-brand-50">
                   <td className="py-2 pr-3">{c.clinicName}</td>
                   <td className={`${cell} font-medium`}>{fmtNum(c.waitingNow)}</td>
+                  <td className={cell}>{fmtNum(waitingScreen(c))}</td>
                   <td className={cell}>{fmtNum(c.waitingForDoctor)}</td>
                   <td className={cell}>{fmtNum(c.seenToday)}</td>
                   <td className={cell}>
@@ -58,6 +63,7 @@ export function OpdClinicTable({ clinics, totals }: { clinics: ClinicWait[]; tot
               <tr className="font-semibold">
                 <td className="py-2 pr-3">รวมทั้งโรงพยาบาล</td>
                 <td className={cell}>{fmtNum(totals.waitingNow)}</td>
+                <td className={cell}>{fmtNum(waitingScreen(totals))}</td>
                 <td className={cell}>{fmtNum(totals.waitingForDoctor)}</td>
                 <td className={cell}>{fmtNum(totals.seenToday)}</td>
                 <td className={cell}>
