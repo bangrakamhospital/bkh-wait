@@ -1,4 +1,5 @@
 import type { ReactNode } from "react";
+import { Users } from "lucide-react";
 import type { ClinicWait, OpdBoard, WaitSegment } from "@/lib/opd/types";
 import { fmtNum, fmtPct, waitTone } from "../format";
 import { Badge, Card, EmptyState } from "../ui";
@@ -210,6 +211,9 @@ export function OpdClinicTable({ clinics, totals }: { clinics: ClinicWait[]; tot
               <p>
                 ยังไม่พบแพทย์ = รอซักประวัติ/คัดกรอง + รอพบแพทย์ (ตรงกับ 2 กลุ่มแรกของ visit วันนี้ด้านบน)
                 นับเฉพาะคลินิกที่มีแพทย์ตรวจ ไม่รวม ER, Lab อย่างเดียว, ทันตกรรม, คลินิกตา
+              </p>
+              <p className="inline-flex flex-wrap items-center gap-1">
+                <Users aria-hidden className="h-3.5 w-3.5 text-brand-600" /> ตัวเลขที่เป็นปุ่ม กดเพื่อดูรายชื่อผู้รอ (HN) ของคลินิกนั้น เฉพาะเจ้าหน้าที่ที่เข้าสู่ระบบ
               </p>
               <p>
                 สีเวลารอ: <span className="text-emerald-700">น้อยกว่า 30 นาที</span> ·{" "}
