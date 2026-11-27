@@ -38,7 +38,7 @@ export function OpdGrid2D({ flow, clinics }: { flow: OpdFlow | null; clinics: Cl
       <div className="text-sm font-semibold text-slate-700">หน้าห้องตรวจ · รอพบแพทย์</div>
       <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-3">
         {clinics.map((c) => {
-          const est = c.estimatedWaitMinutes;
+          const est = c.estimatedDoctorWaitMinutes;
           return (
             <div key={c.clinicCode} className="rounded-md border border-brand-100 bg-surface p-3">
               <div className="text-sm font-semibold">{c.clinicName}</div>

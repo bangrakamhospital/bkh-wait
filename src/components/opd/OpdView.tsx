@@ -26,24 +26,25 @@ export function OpdView({ board }: { board: OpdBoard }) {
           hint="แพทย์เปิดตรวจที่ห้องตรวจ ไม่รวม ER"
         />
         <StatTile
-          label="เวลารอพบแพทย์เฉลี่ย"
-          value={minutes(t.avgWaitMinutes)}
+          label="ซักประวัติ → พบแพทย์ (มัธยฐาน)"
+          value={minutes(t.screenToDoctor.medianMinutes)}
           unit="นาที"
-          tone={t.avgWaitMinutes === null ? "slate" : waitTone(t.avgWaitMinutes)}
-          hint="ลงทะเบียน → พบแพทย์"
+          tone={t.screenToDoctor.medianMinutes === null ? "slate" : waitTone(t.screenToDoctor.medianMinutes)}
+          hint={`เฉลี่ย ${minutes(t.screenToDoctor.avgMinutes)} · P90 ${minutes(t.screenToDoctor.p90Minutes)} นาที (${fmtNum(t.screenToDoctor.n)} ราย)`}
         />
         <StatTile
-          label="เวลารอ (มัธยฐาน)"
-          value={minutes(t.medianWaitMinutes)}
+          label="พบแพทย์ → รับยา (มัธยฐาน)"
+          value={minutes(t.doctorToRx.medianMinutes)}
           unit="นาที"
-          tone={t.medianWaitMinutes === null ? "slate" : waitTone(t.medianWaitMinutes)}
+          tone={t.doctorToRx.medianMinutes === null ? "slate" : waitTone(t.doctorToRx.medianMinutes)}
+          hint={`เฉลี่ย ${minutes(t.doctorToRx.avgMinutes)} · P90 ${minutes(t.doctorToRx.p90Minutes)} นาที (${fmtNum(t.doctorToRx.n)} ราย ที่รับยาแล้ว)`}
         />
         <StatTile
-          label="รอนานสุดขณะนี้"
-          value={t.waitingNow > 0 ? fmtNum(Math.round(t.longestWaitMinutes)) : "-"}
+          label="รอนานสุดขณะนี้ (หลังซักประวัติ)"
+          value={t.longestScreenWaitMinutes === null ? "-" : fmtNum(Math.round(t.longestScreenWaitMinutes))}
           unit="นาที"
-          tone={t.waitingNow > 0 ? waitTone(t.longestWaitMinutes) : "slate"}
-          hint="ในผู้ที่ยังไม่พบแพทย์ขณะนี้"
+          tone={t.longestScreenWaitMinutes === null ? "slate" : waitTone(t.longestScreenWaitMinutes)}
+          hint="ผู้ที่ซักประวัติแล้วและยังรอพบแพทย์"
         />
       </div>
 

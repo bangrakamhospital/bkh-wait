@@ -37,12 +37,17 @@
 //   visits are now, by HOSxP's current cur_dep).
 // --backfill=N (1-92): also write finalized rows for the N days before
 //   today that have no opd_daily rows yet (first install).
+// --resegment=N (1-92): recompute ONLY the wait-segment columns (db/009:
+//   screening -> doctor, doctor -> medicine) of the finalized days among
+//   the N days before today (days finalized before db/009). Nothing else
+//   of a finalized day changes.
 
 import { errCode, fetchClock, openHis, SyncError } from "./lib/hosxp.mjs";
 import {
   addDays,
   aggregateDay,
   classifyFlow,
+  emptyAgg,
   estimateWait,
   fetchDepartmentNames,
   fetchDoctorsActive,
@@ -61,7 +66,7 @@ const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
 
 const argv = process.argv.slice(2);
 if (argv.includes("--help") || argv.includes("-h")) {
-  console.log("usage: node --env-file=.env.sync scripts/sync-opd.mjs [--dry-run [--date=YYYY-MM-DD]] [--backfill=N]");
+  console.log("usage: node --env-file=.env.sync scripts/sync-opd.mjs [--dry-run [--date=YYYY-MM-DD]] [--backfill=N] [--resegment=N]");
   process.exit(0);
 }
 const dryRun = argv.includes("--dry-run");
@@ -74,6 +79,12 @@ if (dateArg !== null && (!DATE_RE.test(dateArg) || !dryRun)) {
 const backfill = backfillArg === null ? 0 : Number(backfillArg);
 if (!Number.isInteger(backfill) || backfill < 0 || backfill > 92) {
   console.error("--backfill=N: N must be 1-92");
+  process.exit(2);
+}
+const resegmentArg = argv.find((a) => a.startsWith("--resegment="))?.slice(12) ?? null;
+const resegment = resegmentArg === null ? 0 : Number(resegmentArg);
+if (!Number.isInteger(resegment) || resegment < 0 || resegment > 92) {
+  console.error("--resegment=N: N must be 1-92");
   process.exit(2);
 }
 
@@ -103,7 +114,13 @@ function dayRows(agg, names) {
   });
 }
 
-async function readHis(his, { routesStored, openDays, backfillDays }) {
+/** Segment summary for the dry-run report: stats + fill counts. */
+function segReport(waits, excluded, base) {
+  const { avg, median, p90 } = waitStats(waits);
+  return { n: waits.length, excluded, recorded: waits.length + excluded, base, avg, median, p90 };
+}
+
+async function readHis(his, { routesStored, openDays, backfillDays, resegmentDays }) {
   const clock = await fetchClock(his);
   const today = dateArg ?? clock.today;
   const names = await fetchDepartmentNames(his);
@@ -115,12 +132,17 @@ async function readHis(his, { routesStored, openDays, backfillDays }) {
   for (const day of new Set([...openDays, ...backfillDays])) {
     if (day < clock.today) closing.push({ day, visits: await fetchVisits(his, day) });
   }
-  return { clock, today, names, routes, routesFresh: routesStored === null, visits, doctors, closing, countCheck };
+  const closingDays = new Set(closing.map((c) => c.day));
+  const reseg = [];
+  for (const day of resegmentDays) {
+    if (day < clock.today && !closingDays.has(day)) reseg.push({ day, visits: await fetchVisits(his, day) });
+  }
+  return { clock, today, names, routes, routesFresh: routesStored === null, visits, doctors, closing, reseg, countCheck };
 }
 
 function summarize(h) {
   const nowMs = dateArg ? null : hisMs(h.clock.now);
-  const clinicSet = clinicSetOf(h.routes.clinics, h.visits, ...h.closing.map((c) => c.visits));
+  const clinicSet = clinicSetOf(h.routes.clinics, h.visits, ...h.closing.map((c) => c.visits), ...h.reseg.map((c) => c.visits));
   const route = new Map(h.routes.routes.map((r) => [r.fromDep, r.clinicCode]));
   const todayAgg = aggregateDay(h.visits, clinicSet, route, nowMs);
   for (const c of clinicSet) if (!todayAgg.has(c)) todayAgg.set(c, emptyAgg());
@@ -133,16 +155,13 @@ function summarize(h) {
     day: c.day,
     rows: dayRows(aggregateDay(c.visits, clinicSet, route, null), h.names),
   }));
+  const reseg = h.reseg.map((c) => ({
+    day: c.day,
+    rows: dayRows(aggregateDay(c.visits, clinicSet, route, null), h.names),
+  }));
   // The flow is always "now": cur_dep is HOSxP's current state (also for --date).
   const flow = classifyFlow(h.visits, clinicSet, route, hisMs(h.clock.now));
-  return { nowMs, clinicSet, today, closing, flow };
-}
-
-function emptyAgg() {
-  return {
-    visits: 0, seen: 0, waits: [], waitingNow: 0, waitingForDoctor: 0, longestWait: 0, seenLastHour: 0,
-    hourly: Array.from({ length: 24 }, () => ({ arrived: 0, seen: 0, waitSum: 0, waitN: 0 })),
-  };
+  return { nowMs, clinicSet, today, closing, reseg, flow };
 }
 
 function dryRunReport(h, s) {
@@ -168,17 +187,29 @@ function dryRunReport(h, s) {
         seenLastHour: r.e.seenLastHour,
         doctorsActive: r.doctorsActive,
         estimatedWait: r.estimatedWait,
-        avg: r.avg,
-        median: r.median,
-        p90: r.p90,
-        within60Pct: r.within60,
+        longestScreenWait: r.e.longestScreenWait,
+        estimatedAfterScreen: s.nowMs === null ? null : estimateWait(r.e.waitingForDoctor, r.e.seenLastHour),
+        regToDoctor: { avg: r.avg, median: r.median, p90: r.p90, within60Pct: r.within60 },
+        screenToDoctor: segReport(r.e.screenWaits, r.e.screenExcluded, r.seen),
+        doctorToRx: segReport(r.e.rxWaits, r.e.rxExcluded, r.e.seenWithRx),
       })),
     totals: {
       visits: sum("visits"),
       seen: sum("seen"),
       waitingNow: sum("waitingNow"),
       waitingForDoctor: sum("waitingForDoctor"),
-      ...waitStats(all),
+      regToDoctor: waitStats(all),
+      screenToDoctor: segReport(
+        s.today.flatMap((r) => r.e.screenWaits).sort((a, b) => a - b),
+        sum("screenExcluded"),
+        sum("seen"),
+      ),
+      doctorToRx: segReport(
+        s.today.flatMap((r) => r.e.rxWaits).sort((a, b) => a - b),
+        sum("rxExcluded"),
+        sum("seenWithRx"),
+      ),
+      longestScreenWait: s.today.reduce((m, r) => (r.e.longestScreenWait === null ? m : Math.max(m ?? 0, r.e.longestScreenWait)), null),
     },
     flow: {
       total: s.flow.total,
@@ -190,12 +221,16 @@ function dryRunReport(h, s) {
       boardWaitingForDoctor: sum("waitingForDoctor"),
     },
     hourly: Array.from({ length: 24 }, (_, hour) => {
-      let arrived = 0, seen = 0, ws = 0, wn = 0;
+      let arrived = 0, seen = 0, ws = 0, wn = 0, ss = 0, sn = 0;
       for (const r of s.today) {
         const x = r.hourly[hour];
-        arrived += x.arrived; seen += x.seen; ws += x.waitSum; wn += x.waitN;
+        arrived += x.arrived; seen += x.seen; ws += x.waitSum; wn += x.waitN; ss += x.screenSum; sn += x.screenN;
       }
-      return { hour, arrived, seen, avgWait: wn ? Math.round((ws / wn) * 10) / 10 : null };
+      return {
+        hour, arrived, seen,
+        avgWait: wn ? Math.round((ws / wn) * 10) / 10 : null,
+        avgScreenWait: sn ? Math.round((ss / sn) * 10) / 10 : null,
+      };
     }).filter((x) => x.arrived || x.seen),
     clinicSet: [...s.clinicSet].sort(),
     routes: h.routes.routes,
@@ -221,6 +256,16 @@ async function readPgState(client) {
       routes: r.rows.map((x) => ({ fromDep: x.from_dep, clinicCode: x.clinic_code, visits: Number(x.visits), share: Number(x.seen_share) })),
     };
   }
+  let resegmentDays = [];
+  if (resegment > 0) {
+    const fin = await client.query(
+      `SELECT DISTINCT visit_date::text AS d FROM opd_daily
+        WHERE finalized_at IS NOT NULL AND visit_date >= current_date - $1::int AND visit_date < current_date
+        ORDER BY 1`,
+      [resegment],
+    );
+    resegmentDays = fin.rows.map((x) => x.d);
+  }
   let backfillDays = [];
   if (backfill > 0) {
     const have = await client.query("SELECT DISTINCT visit_date::text AS d FROM opd_daily WHERE visit_date >= current_date - $1::int", [backfill]);
@@ -231,37 +276,46 @@ async function readPgState(client) {
       if (!got.has(d)) backfillDays.push(d);
     }
   }
-  return { openDays: open.rows.map((x) => x.d), routesStored, backfillDays };
+  return { openDays: open.rows.map((x) => x.d), routesStored, backfillDays, resegmentDays };
 }
 
 async function writeDay(client, day, rows, finalize) {
   await client.query("DELETE FROM opd_hourly WHERE visit_date = $1", [day]);
-  const hc = [], hh = [], ha = [], hs = [], hws = [], hwn = [];
+  const hc = [], hh = [], ha = [], hs = [], hws = [], hwn = [], hss = [], hsn = [];
   for (const r of rows) {
     r.hourly.forEach((x, hour) => {
       if (!x.arrived && !x.seen) return;
       hc.push(r.clinic); hh.push(hour); ha.push(x.arrived); hs.push(x.seen); hws.push(x.waitSum); hwn.push(x.waitN);
+      hss.push(x.screenSum); hsn.push(x.screenN);
     });
   }
   await client.query(
-    `INSERT INTO opd_hourly (visit_date, clinic_code, hour, arrived, seen, wait_sum, wait_n)
-     SELECT $1::date, x.c, x.h, x.a, x.s, x.ws, x.wn
-       FROM unnest($2::text[], $3::int[], $4::int[], $5::int[], $6::int[], $7::int[]) AS x(c, h, a, s, ws, wn)`,
-    [day, hc, hh, ha, hs, hws, hwn],
+    `INSERT INTO opd_hourly (visit_date, clinic_code, hour, arrived, seen, wait_sum, wait_n, screen_wait_sum, screen_wait_n)
+     SELECT $1::date, x.c, x.h, x.a, x.s, x.ws, x.wn, x.ss, x.sn
+       FROM unnest($2::text[], $3::int[], $4::int[], $5::int[], $6::int[], $7::int[], $8::int[], $9::int[])
+            AS x(c, h, a, s, ws, wn, ss, sn)`,
+    [day, hc, hh, ha, hs, hws, hwn, hss, hsn],
   );
   const d = rows.filter((r) => r.visits > 0);
   await client.query(
     `INSERT INTO opd_daily (visit_date, clinic_code, clinic_name, visits, seen, avg_wait, median_wait, p90_wait,
-                            within60_pct, wait_minutes, finalized_at, updated_at)
+                            within60_pct, wait_minutes, finalized_at, updated_at,
+                            screen_wait_minutes, screen_excluded, rx_wait_minutes, rx_excluded, seen_with_rx, segments_at)
      SELECT $1::date, x.c, x.name, x.v, x.s, x.avg, x.med, x.p90, x.w60,
             CASE WHEN x.waits = '' THEN '{}'::int[] ELSE string_to_array(x.waits, ',')::int[] END,
-            CASE WHEN $2::boolean THEN now() END, now()
+            CASE WHEN $2::boolean THEN now() END, now(),
+            CASE WHEN x.sw = '' THEN '{}'::int[] ELSE string_to_array(x.sw, ',')::int[] END, x.sx,
+            CASE WHEN x.rw = '' THEN '{}'::int[] ELSE string_to_array(x.rw, ',')::int[] END, x.rx, x.swr, now()
        FROM unnest($3::text[], $4::text[], $5::int[], $6::int[], $7::numeric[], $8::numeric[], $9::numeric[],
-                   $10::numeric[], $11::text[]) AS x(c, name, v, s, avg, med, p90, w60, waits)
+                   $10::numeric[], $11::text[], $12::text[], $13::int[], $14::text[], $15::int[], $16::int[])
+            AS x(c, name, v, s, avg, med, p90, w60, waits, sw, sx, rw, rx, swr)
      ON CONFLICT (visit_date, clinic_code) DO UPDATE
        SET clinic_name = EXCLUDED.clinic_name, visits = EXCLUDED.visits, seen = EXCLUDED.seen,
            avg_wait = EXCLUDED.avg_wait, median_wait = EXCLUDED.median_wait, p90_wait = EXCLUDED.p90_wait,
            within60_pct = EXCLUDED.within60_pct, wait_minutes = EXCLUDED.wait_minutes,
+           screen_wait_minutes = EXCLUDED.screen_wait_minutes, screen_excluded = EXCLUDED.screen_excluded,
+           rx_wait_minutes = EXCLUDED.rx_wait_minutes, rx_excluded = EXCLUDED.rx_excluded,
+           seen_with_rx = EXCLUDED.seen_with_rx, segments_at = EXCLUDED.segments_at,
            finalized_at = EXCLUDED.finalized_at, updated_at = now()
        WHERE opd_daily.finalized_at IS NULL`,
     [
@@ -276,13 +330,20 @@ async function writeDay(client, day, rows, finalize) {
       d.map((r) => r.p90),
       d.map((r) => r.within60),
       d.map((r) => r.waits.join(",")),
+      d.map((r) => r.e.screenWaits.join(",")),
+      d.map((r) => r.e.screenExcluded),
+      d.map((r) => r.e.rxWaits.join(",")),
+      d.map((r) => r.e.rxExcluded),
+      d.map((r) => r.e.seenWithRx),
     ],
   );
   if (finalize) {
     // clinics with a row from an earlier run but no visit in the recount
     await client.query(
       `UPDATE opd_daily SET visits = 0, seen = 0, avg_wait = NULL, median_wait = NULL, p90_wait = NULL,
-              within60_pct = NULL, wait_minutes = '{}', finalized_at = now(), updated_at = now()
+              within60_pct = NULL, wait_minutes = '{}', screen_wait_minutes = '{}', screen_excluded = 0,
+              rx_wait_minutes = '{}', rx_excluded = 0, seen_with_rx = 0, segments_at = now(),
+              finalized_at = now(), updated_at = now()
         WHERE visit_date = $1 AND finalized_at IS NULL`,
       [day],
     );
@@ -292,6 +353,47 @@ async function writeDay(client, day, rows, finalize) {
       [day, d.map((r) => r.clinic)],
     );
   }
+}
+
+/**
+ * --resegment: write ONLY the wait-segment columns of a finalized day
+ * (opd_daily rows that exist; opd_hourly screen sums of existing hours).
+ * Visits / seen / registration waits of the finalized day stay untouched.
+ */
+async function writeSegments(client, day, rows) {
+  const d = rows.filter((r) => r.visits > 0);
+  const res = await client.query(
+    `UPDATE opd_daily o
+        SET screen_wait_minutes = CASE WHEN x.sw = '' THEN '{}'::int[] ELSE string_to_array(x.sw, ',')::int[] END,
+            screen_excluded = x.sx,
+            rx_wait_minutes = CASE WHEN x.rw = '' THEN '{}'::int[] ELSE string_to_array(x.rw, ',')::int[] END,
+            rx_excluded = x.rx, seen_with_rx = x.swr, segments_at = now()
+       FROM unnest($2::text[], $3::text[], $4::int[], $5::text[], $6::int[], $7::int[]) AS x(c, sw, sx, rw, rx, swr)
+      WHERE o.visit_date = $1::date AND o.clinic_code = x.c AND o.finalized_at IS NOT NULL`,
+    [
+      day,
+      d.map((r) => r.clinic),
+      d.map((r) => r.e.screenWaits.join(",")),
+      d.map((r) => r.e.screenExcluded),
+      d.map((r) => r.e.rxWaits.join(",")),
+      d.map((r) => r.e.rxExcluded),
+      d.map((r) => r.e.seenWithRx),
+    ],
+  );
+  const hc = [], hh = [], hss = [], hsn = [];
+  for (const r of rows) {
+    r.hourly.forEach((x, hour) => {
+      if (!x.screenN) return;
+      hc.push(r.clinic); hh.push(hour); hss.push(x.screenSum); hsn.push(x.screenN);
+    });
+  }
+  await client.query(
+    `UPDATE opd_hourly h SET screen_wait_sum = x.ss, screen_wait_n = LEAST(x.sn, h.seen)
+       FROM unnest($2::text[], $3::int[], $4::int[], $5::int[]) AS x(c, hr, ss, sn)
+      WHERE h.visit_date = $1::date AND h.clinic_code = x.c AND h.hour = x.hr`,
+    [day, hc, hh, hss, hsn],
+  );
+  return res.rowCount;
 }
 
 async function writePg(client, h, s, startedAt) {
@@ -329,11 +431,16 @@ async function writePg(client, h, s, startedAt) {
   const t = s.today;
   await client.query(
     `INSERT INTO opd_state (clinic_code, sync_run_id, visit_date, waiting_now, waiting_for_doctor, longest_wait_minutes,
-                            seen_today, visits_today, seen_last_hour, doctors_active, wait_minutes)
+                            seen_today, visits_today, seen_last_hour, doctors_active, wait_minutes,
+                            screen_wait_minutes, screen_excluded, rx_wait_minutes, rx_excluded, seen_with_rx,
+                            longest_screen_wait_minutes)
      SELECT x.c, $1::bigint, $2::date, x.wn, x.wfd, x.lw, x.st, x.vt, x.slh, x.da,
-            CASE WHEN x.waits = '' THEN '{}'::int[] ELSE string_to_array(x.waits, ',')::int[] END
-       FROM unnest($3::text[], $4::int[], $5::int[], $6::int[], $7::int[], $8::int[], $9::int[], $10::int[], $11::text[])
-            AS x(c, wn, wfd, lw, st, vt, slh, da, waits)`,
+            CASE WHEN x.waits = '' THEN '{}'::int[] ELSE string_to_array(x.waits, ',')::int[] END,
+            CASE WHEN x.sw = '' THEN '{}'::int[] ELSE string_to_array(x.sw, ',')::int[] END, x.sx,
+            CASE WHEN x.rw = '' THEN '{}'::int[] ELSE string_to_array(x.rw, ',')::int[] END, x.rx, x.swr, x.lsw
+       FROM unnest($3::text[], $4::int[], $5::int[], $6::int[], $7::int[], $8::int[], $9::int[], $10::int[], $11::text[],
+                   $12::text[], $13::int[], $14::text[], $15::int[], $16::int[], $17::int[])
+            AS x(c, wn, wfd, lw, st, vt, slh, da, waits, sw, sx, rw, rx, swr, lsw)`,
     [
       run.id,
       h.today,
@@ -346,6 +453,12 @@ async function writePg(client, h, s, startedAt) {
       t.map((r) => r.e.seenLastHour),
       t.map((r) => r.doctorsActive),
       t.map((r) => r.waits.join(",")),
+      t.map((r) => r.e.screenWaits.join(",")),
+      t.map((r) => r.e.screenExcluded),
+      t.map((r) => r.e.rxWaits.join(",")),
+      t.map((r) => r.e.rxExcluded),
+      t.map((r) => r.e.seenWithRx),
+      t.map((r) => r.e.longestScreenWait),
     ],
   );
 
@@ -357,6 +470,7 @@ async function writePg(client, h, s, startedAt) {
   );
 
   for (const c of s.closing) await writeDay(client, c.day, c.rows, true);
+  for (const c of s.reseg) await writeSegments(client, c.day, c.rows);
   await writeDay(client, h.today, s.today, false);
 
   await client.query("COMMIT");
@@ -380,7 +494,7 @@ async function main() {
   let his = null;
   let stage = "his";
   try {
-    let pgState = { openDays: [], routesStored: null, backfillDays: [] };
+    let pgState = { openDays: [], routesStored: null, backfillDays: [], resegmentDays: [] };
     if (!dryRun) {
       stage = "pg";
       client = await openPg("bkh-wait-sync-opd");
@@ -405,6 +519,7 @@ async function main() {
       `${ts()} opd sync ok: run ${runId}, ${h.today}, ${s.clinicSet.size} clinic(s), waiting ${waiting}, seen ${seen}, visits ${s.flow.total}` +
         (h.routesFresh ? ", routes refreshed" : "") +
         (h.closing.length ? `, finalized ${h.closing.map((c) => c.day).join(" ")}` : "") +
+        (h.reseg.length ? `, resegmented ${h.reseg.length} day(s)` : "") +
         `, ${Date.now() - startedAt.getTime()} ms`,
     );
   } catch (err) {
