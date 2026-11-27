@@ -49,7 +49,36 @@
 // - estimatedWaitMinutes = ceil(waitingNow * 60 / seenLastHour), capped at
 //   STALE_WAIT_MINUTES: time to clear the current queue at the pace of the
 //   last hour (all doctors together); null when nobody was seen in the
-//   last hour (no doctor working now = unknown).
+//   last hour (no doctor working now = unknown). The board derives the
+//   same estimate from waitingForDoctor too (wait after screening).
+//
+// Wait segments (the way auditors measure them; verified on HOSxP
+// 2026-11-20 .. 2026-11-27, docs/api.md "Wait segments"):
+//   screen time   the LATEST OPD-SCREEN service_begin_datetime at or before
+//                 the doctor exam start (not seen yet: the latest one). The
+//                 opdscreen table is no use: begintime / endtime / outtime
+//                 are empty in every row, update_datetime is the last edit.
+//                 Screening takes a median 3 min (begin -> end) and the end
+//                 is often re-saved after the doctor, so begin is the
+//                 stable stamp.
+//   doctor time   the first OPD-DOCTOR row at a clinic (as above): begin =
+//                 exam start, end = exam screen closed (median 1-4 min
+//                 later; missing end -> begin).
+//   medicine      the earliest rx_dispenser_detail.rx_dispenser_datetime
+//                 of rx_dispenser_type_id 4 "ผู้จ่ายยา" (pharmacist who
+//                 handed the drugs over, depcode 013). Types 1 (prescription
+//                 keyed in at the pharmacy) / 2 (prepared) / 3 (checked) are
+//                 earlier steps. The visit is mostly sent home in the same
+//                 minute (opd_dep_queue 999). rx_operator.pay / call_time,
+//                 ovst_rx_queue, rx_queue_dispense, ovst_queue_server_* and
+//                 opitemrece_pay are empty here.
+//   screenToDoctor = doctor exam start - screen time (seen visits)
+//   doctorToRx     = medicine - doctor exam end (seen visits with a drug
+//                    item: opitemrece JOIN drugitems)
+//   Negative or > SEGMENT_MAX_MINUTES values are left out of the statistics
+//   and counted (screenExcluded / rxExcluded).
+//   longestScreenWait = longest (now - screen time) among the visits
+//   waiting now that were screened (<= STALE_WAIT_MINUTES), null if none.
 //
 // Visit flow (classifyFlow, verified on HOSxP 2026-11-24 .. 2026-11-27):
 // EVERY ovst row of the day (ER included) = COUNT(*) FROM ovst WHERE
@@ -58,9 +87,9 @@
 //   admit         ovst.an set, or cur_dep 010 (IPD)
 //   er            main_dep 011 or cur_dep 011 (ER visit, whatever its state)
 //   done          cur_dep 999 (sent home)
-//   pharmacy      cur_dep 013 pharmacy / 014 cashier. HOSxP here records no
-//                 dispense time (rx_operator.pay / ovst_rx_queue are not
-//                 used), so a visit stays here until staff send it home.
+//   pharmacy      cur_dep 013 pharmacy / 014 cashier. A visit stays here
+//                 until staff send it home, also after the drugs were
+//                 handed over (rx_dispenser_detail type 4, wait segments).
 //   screening     the board's waitingNow minus waitingForDoctor (not seen,
 //                 not screened, not in front of the clinic room)
 //   doctor        the board's waitingForDoctor (not seen, screened or at the
@@ -84,6 +113,10 @@ export const ROUTE_MIN_SHARE = 0.5;
 export const ROUTE_MIN_VISITS = 5;
 export const STALE_WAIT_MINUTES = 480;
 export const MAX_WAIT_MINUTES = 720;
+/** Segment waits above this (or negative) are impossible / stale: excluded and counted. */
+export const SEGMENT_MAX_MINUTES = 480;
+/** rx_dispenser_type_id of the pharmacist who handed the drugs over (ผู้จ่ายยา). */
+export const RX_DISPENSE_TYPE = 4;
 export const ER_DEP = "011";
 /** Departments that are not doctor-exam clinics even with OPD-DOCTOR rows. */
 export const NON_DOCTOR_DEPS = [
@@ -151,7 +184,7 @@ export async function fetchDepartmentNames(his) {
 // First OPD-DOCTOR row per visit at a clinic, for the visits of [lo, hi).
 // MariaDB runs it as a LATERAL DERIVED table on ix_vn (EXPLAIN checked).
 const FIRST_DOCTOR = `
-  SELECT t.vn, t.depcode, t.service_begin_datetime AS b,
+  SELECT t.vn, t.depcode, t.service_begin_datetime AS b, t.service_end_datetime AS e,
          ROW_NUMBER() OVER (PARTITION BY t.vn ORDER BY t.service_begin_datetime, t.ovst_service_time_id) AS rn
     FROM ovst_service_time t
    WHERE t.vn >= :lo AND t.vn < :hi
@@ -204,7 +237,8 @@ export async function fetchRoutes(his, today) {
 /**
  * One row per visit of `date` — ALL ovst rows of the day, ER included
  * (er = true; the per-clinic board skips them) — coded fields only:
- * { regMs, mainDep, curDep, er, admitted, screened, docDep, docMs }.
+ * { regMs, mainDep, curDep, er, admitted, screened, docDep, docMs,
+ *   docEndMs, scrMs, rxMs, hasRx } (wait segments: see header).
  */
 export async function fetchVisits(his, date) {
   const rows = await his.query(
@@ -212,11 +246,18 @@ export async function fetchVisits(his, date) {
             (o.an IS NOT NULL AND o.an <> '') AS admitted,
             EXISTS (SELECT 1 FROM ovst_service_time s
                      WHERE s.vn = o.vn AND s.ovst_service_time_type_code = 'OPD-SCREEN') AS screened,
-            d.depcode AS doc_dep, d.b AS doc_at
+            d.depcode AS doc_dep, d.b AS doc_at, d.e AS doc_end,
+            (SELECT MAX(s.service_begin_datetime) FROM ovst_service_time s
+              WHERE s.vn = o.vn AND s.ovst_service_time_type_code = 'OPD-SCREEN'
+                AND (d.b IS NULL OR s.service_begin_datetime <= d.b)) AS scr_at,
+            (SELECT MIN(x.rx_dispenser_datetime) FROM rx_dispenser_detail x
+              WHERE x.vn = o.vn AND x.rx_dispenser_type_id = :rxType) AS rx_at,
+            EXISTS (SELECT 1 FROM opitemrece r JOIN drugitems di ON di.icode = r.icode
+                     WHERE r.vn = o.vn) AS has_rx
        FROM ovst o
        LEFT JOIN (${FIRST_DOCTOR}) d ON d.vn = o.vn AND d.rn = 1
       WHERE o.vstdate = :d`,
-    { d: date, lo: vnPrefix(date), hi: vnPrefix(addDays(date, 1)), nonDoctor: NON_DOCTOR_CSV },
+    { d: date, lo: vnPrefix(date), hi: vnPrefix(addDays(date, 1)), nonDoctor: NON_DOCTOR_CSV, rxType: RX_DISPENSE_TYPE },
   );
   return rows.map((r) => ({
     regMs: r.reg_at ? hisMs(r.reg_at) : null,
@@ -227,6 +268,10 @@ export async function fetchVisits(his, date) {
     screened: num(r.screened) === 1,
     docDep: code(r.doc_dep) || null,
     docMs: r.doc_at ? hisMs(r.doc_at) : null,
+    docEndMs: r.doc_end ? hisMs(r.doc_end) : null,
+    scrMs: r.scr_at ? hisMs(r.scr_at) : null,
+    rxMs: r.rx_at ? hisMs(r.rx_at) : null,
+    hasRx: num(r.has_rx) === 1,
   }));
 }
 
@@ -289,18 +334,14 @@ const bkkHour = (ms) => new Date(ms + 7 * 3_600_000).getUTCHours();
  * Per-clinic aggregates of one day.
  *   visits: fetchVisits rows; clinicSet: Set of clinic codes;
  *   route: Map from_dep -> clinic; nowMs: HOSxP now (live) or null (closed day)
- * -> Map clinic -> { visits, seen, waits(sorted), waitingNow, waitingForDoctor,
- *                    longestWait, seenLastHour, hourly: [24 x {arrived, seen, waitSum, waitN}] }
+ * -> Map clinic -> emptyAgg() shape (see there)
  */
 export function aggregateDay(visits, clinicSet, route, nowMs) {
   const out = new Map();
   const get = (c) => {
     let e = out.get(c);
     if (!e) {
-      e = {
-        visits: 0, seen: 0, waits: [], waitingNow: 0, waitingForDoctor: 0, longestWait: 0, seenLastHour: 0,
-        hourly: Array.from({ length: 24 }, () => ({ arrived: 0, seen: 0, waitSum: 0, waitN: 0 })),
-      };
+      e = emptyAgg();
       out.set(c, e);
     }
     return e;
@@ -323,6 +364,25 @@ export function aggregateDay(visits, clinicSet, route, nowMs) {
         h.waitSum += wait;
         h.waitN += 1;
       }
+      // screening -> doctor exam start
+      if (v.scrMs !== null) {
+        const m = segmentMinutes(v.scrMs, v.docMs);
+        if (m === null) e.screenExcluded += 1;
+        else {
+          e.screenWaits.push(m);
+          h.screenSum += m;
+          h.screenN += 1;
+        }
+      }
+      // doctor exam end -> medicine handed over (visits with a drug item)
+      if (v.hasRx) {
+        e.seenWithRx += 1;
+        if (v.rxMs !== null) {
+          const m = segmentMinutes(v.docEndMs ?? v.docMs, v.rxMs);
+          if (m === null) e.rxExcluded += 1;
+          else e.rxWaits.push(m);
+        }
+      }
       if (nowMs !== null && v.docMs >= nowMs - 3_600_000 && v.docMs <= nowMs + 60_000) e.seenLastHour += 1;
       continue;
     }
@@ -338,9 +398,38 @@ export function aggregateDay(visits, clinicSet, route, nowMs) {
     e.waitingNow += 1;
     if (w.forDoctor) e.waitingForDoctor += 1;
     e.longestWait = Math.max(e.longestWait, w.age);
+    if (v.scrMs !== null) {
+      const since = Math.round((nowMs - v.scrMs) / 60_000);
+      if (since >= 0 && since <= STALE_WAIT_MINUTES) e.longestScreenWait = Math.max(e.longestScreenWait ?? 0, since);
+    }
   }
-  for (const e of out.values()) e.waits.sort((a, b) => a - b);
+  for (const e of out.values()) {
+    e.waits.sort((a, b) => a - b);
+    e.screenWaits.sort((a, b) => a - b);
+    e.rxWaits.sort((a, b) => a - b);
+  }
   return out;
+}
+
+/**
+ * Empty per-clinic aggregate: { visits, seen, waits (registration -> doctor,
+ * sorted), waitingNow, waitingForDoctor, longestWait, seenLastHour,
+ * screenWaits / rxWaits (segments, sorted), screenExcluded / rxExcluded,
+ * seenWithRx, longestScreenWait (null = nobody screened is waiting),
+ * hourly: 24 x { arrived, seen, waitSum, waitN, screenSum, screenN } }.
+ */
+export function emptyAgg() {
+  return {
+    visits: 0, seen: 0, waits: [], waitingNow: 0, waitingForDoctor: 0, longestWait: 0, seenLastHour: 0,
+    screenWaits: [], screenExcluded: 0, rxWaits: [], rxExcluded: 0, seenWithRx: 0, longestScreenWait: null,
+    hourly: Array.from({ length: 24 }, () => ({ arrived: 0, seen: 0, waitSum: 0, waitN: 0, screenSum: 0, screenN: 0 })),
+  };
+}
+
+/** Whole minutes from -> to, or null when negative or > SEGMENT_MAX_MINUTES. */
+function segmentMinutes(fromMs, toMs) {
+  const m = Math.round((toMs - fromMs) / 60_000);
+  return m < 0 || m > SEGMENT_MAX_MINUTES ? null : m;
 }
 
 /** Seen by a doctor at a clinic (the board's definition). */

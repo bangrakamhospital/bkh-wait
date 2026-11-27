@@ -2,8 +2,8 @@ import "server-only";
 
 import { isWaitDbConfigured, pgQuery, WaitDbConfigError } from "@/lib/db/pg";
 
-import { mean, median, mergeSorted, percentile } from "./board";
-import type { OpdDaily } from "./types";
+import { mean, median, mergeSorted, percentile, segment } from "./board";
+import type { OpdDaily, WaitSegment } from "./types";
 
 /** Daily OPD waits per clinic (wait.opd_daily, written by scripts/sync-opd.mjs). Visible clinics only. */
 
@@ -16,13 +16,47 @@ export interface OpdDayTotal {
   medianWaitMinutes: number | null;
   p90WaitMinutes: number | null;
   within60Pct: number | null;
+  /** null when no clinic row of the day has segment data (finalized before db/009). */
+  screenToDoctor: WaitSegment | null;
+  doctorToRx: WaitSegment | null;
 }
 
 const round1 = (x: number | null): number | null => (x === null ? null : Math.round(x * 10) / 10);
 
+interface SegRow {
+  seen: number;
+  screen_wait_minutes: number[];
+  screen_excluded: number;
+  rx_wait_minutes: number[];
+  rx_excluded: number;
+  seen_with_rx: number;
+  has_segments: boolean;
+}
+
+/** Both segments over some clinic rows of one day (null when none has segment data). */
+function segmentsOf(list: readonly SegRow[]): { screenToDoctor: WaitSegment | null; doctorToRx: WaitSegment | null } {
+  const rows = list.filter((r) => r.has_segments);
+  if (rows.length === 0) return { screenToDoctor: null, doctorToRx: null };
+  const total = (f: (r: SegRow) => number) => rows.reduce((n, r) => n + f(r), 0);
+  return {
+    screenToDoctor: segment(
+      mergeSorted(rows.map((r) => r.screen_wait_minutes ?? [])),
+      total((r) => r.screen_excluded),
+      total((r) => r.seen),
+      round1,
+    ),
+    doctorToRx: segment(
+      mergeSorted(rows.map((r) => r.rx_wait_minutes ?? [])),
+      total((r) => r.rx_excluded),
+      total((r) => r.seen_with_rx),
+      round1,
+    ),
+  };
+}
+
 export async function getOpdDaily(from: string, to: string): Promise<{ rows: OpdDaily[]; days: OpdDayTotal[] }> {
   if (!isWaitDbConfigured()) throw new WaitDbConfigError("wait database is not configured");
-  const raw = await pgQuery<{
+  const raw = await pgQuery<SegRow & {
     visit_date: string;
     clinic_code: string;
     clinic_name: string;
@@ -37,7 +71,9 @@ export async function getOpdDaily(from: string, to: string): Promise<{ rows: Opd
   }>(
     `SELECT d.visit_date, d.clinic_code, coalesce(nullif(btrim(c.display_name), ''), d.clinic_name) AS clinic_name,
             d.visits, d.seen, d.avg_wait, d.median_wait, d.p90_wait, d.within60_pct, d.wait_minutes,
-            d.finalized_at IS NOT NULL AS finalized
+            d.finalized_at IS NOT NULL AS finalized,
+            d.screen_wait_minutes, d.screen_excluded, d.rx_wait_minutes, d.rx_excluded, d.seen_with_rx,
+            d.segments_at IS NOT NULL AS has_segments
        FROM opd_daily d
        LEFT JOIN opd_clinic_config c ON c.clinic_code = d.clinic_code
       WHERE d.visit_date BETWEEN $1::date AND $2::date
@@ -55,6 +91,7 @@ export async function getOpdDaily(from: string, to: string): Promise<{ rows: Opd
     medianWaitMinutes: r.median_wait,
     p90WaitMinutes: r.p90_wait,
     within60Pct: r.within60_pct,
+    ...segmentsOf([r]),
     finalized: r.finalized,
   }));
 
@@ -71,6 +108,7 @@ export async function getOpdDaily(from: string, to: string): Promise<{ rows: Opd
       medianWaitMinutes: round1(median(all)),
       p90WaitMinutes: round1(percentile(all, 0.9)),
       within60Pct: all.length ? round1((all.filter((m) => m <= 60).length / all.length) * 100) : null,
+      ...segmentsOf(list),
     };
   });
   return { rows, days };

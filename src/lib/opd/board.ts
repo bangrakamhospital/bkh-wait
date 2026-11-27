@@ -4,7 +4,7 @@ import { isWaitDbConfigured, WaitDbConfigError, withPgTransaction } from "@/lib/
 import { ApiError } from "@/lib/http";
 
 import { FLOW_DEFS } from "./flow";
-import type { ClinicWait, OpdBoard, OpdFlow, OpdHourPoint } from "./types";
+import type { ClinicWait, OpdBoard, OpdFlow, OpdHourPoint, WaitSegment } from "./types";
 
 /**
  * OPD "waiting to see a doctor" board, read ONLY from PostgreSQL: the last
@@ -68,6 +68,23 @@ export function mergeSorted(lists: readonly (readonly number[])[]): number[] {
   return lists.flat().sort((a, b) => a - b);
 }
 
+/** Segment statistics over sorted minutes; `round` = rounding of avg / median / p90. */
+export function segment(
+  sorted: readonly number[],
+  excluded: number,
+  base: number,
+  round: (x: number | null) => number | null = roundOrNull,
+): WaitSegment {
+  return {
+    avgMinutes: round(mean(sorted)),
+    medianMinutes: round(median(sorted)),
+    p90Minutes: round(percentile(sorted, 0.9)),
+    n: sorted.length,
+    excluded,
+    base,
+  };
+}
+
 interface StateRow {
   clinic_code: string;
   clinic_name: string;
@@ -79,6 +96,12 @@ interface StateRow {
   seen_last_hour: number;
   doctors_active: number;
   wait_minutes: number[];
+  screen_wait_minutes: number[];
+  screen_excluded: number;
+  rx_wait_minutes: number[];
+  rx_excluded: number;
+  seen_with_rx: number;
+  longest_screen_wait_minutes: number | null;
 }
 
 interface HourRow {
@@ -87,6 +110,8 @@ interface HourRow {
   seen: number;
   wait_sum: number;
   wait_n: number;
+  screen_wait_sum: number;
+  screen_wait_n: number;
 }
 
 /** Rough wait for a patient arriving now (same rule as the worker, docs/api.md). */
@@ -108,7 +133,9 @@ async function buildBoard(): Promise<OpdBoard> {
       }
       const rows = await tx.query<StateRow>(
         `SELECT s.clinic_code, c.clinic_name, s.waiting_now, s.waiting_for_doctor, s.longest_wait_minutes,
-                s.seen_today, s.visits_today, s.seen_last_hour, s.doctors_active, s.wait_minutes
+                s.seen_today, s.visits_today, s.seen_last_hour, s.doctors_active, s.wait_minutes,
+                s.screen_wait_minutes, s.screen_excluded, s.rx_wait_minutes, s.rx_excluded, s.seen_with_rx,
+                s.longest_screen_wait_minutes
            FROM opd_state s
            JOIN opd_clinic_catalog c ON c.clinic_code = s.clinic_code
           WHERE c.visible AND (c.active OR s.visits_today > 0 OR s.waiting_now > 0)
@@ -116,7 +143,8 @@ async function buildBoard(): Promise<OpdBoard> {
       );
       const hours = await tx.query<HourRow>(
         `SELECT h.hour, sum(h.arrived)::int AS arrived, sum(h.seen)::int AS seen,
-                sum(h.wait_sum)::int AS wait_sum, sum(h.wait_n)::int AS wait_n
+                sum(h.wait_sum)::int AS wait_sum, sum(h.wait_n)::int AS wait_n,
+                sum(h.screen_wait_sum)::int AS screen_wait_sum, sum(h.screen_wait_n)::int AS screen_wait_n
            FROM opd_hourly h
            JOIN opd_clinic_catalog c ON c.clinic_code = h.clinic_code
           WHERE h.visit_date = $1::date AND c.visible
@@ -159,6 +187,10 @@ async function buildBoard(): Promise<OpdBoard> {
           doctorsActive: r.doctors_active,
           seenLastHour: r.seen_last_hour,
           estimatedWaitMinutes: estimateWait(r.waiting_now, r.seen_last_hour),
+          screenToDoctor: segment(r.screen_wait_minutes ?? [], r.screen_excluded, r.seen_today),
+          doctorToRx: segment(r.rx_wait_minutes ?? [], r.rx_excluded, r.seen_with_rx),
+          longestScreenWaitMinutes: r.longest_screen_wait_minutes,
+          estimatedDoctorWaitMinutes: estimateWait(r.waiting_for_doctor, r.seen_last_hour),
         };
       });
 
@@ -170,11 +202,17 @@ async function buildBoard(): Promise<OpdBoard> {
           arrived: h?.arrived ?? 0,
           seen: h?.seen ?? 0,
           avgWaitMinutes: h && h.wait_n > 0 ? Math.round(h.wait_sum / h.wait_n) : null,
+          avgScreenWaitMinutes: h && h.screen_wait_n > 0 ? Math.round(h.screen_wait_sum / h.screen_wait_n) : null,
         };
       });
 
       const all = mergeSorted(rows.map((r) => r.wait_minutes ?? []));
-      const sum = (k: "waiting_now" | "waiting_for_doctor" | "seen_today") => rows.reduce((n, r) => n + r[k], 0);
+      type SumKey = "waiting_now" | "waiting_for_doctor" | "seen_today" | "screen_excluded" | "rx_excluded" | "seen_with_rx";
+      const sum = (k: SumKey) => rows.reduce((n, r) => n + r[k], 0);
+      const longestScreen = rows.reduce<number | null>(
+        (m, r) => (r.longest_screen_wait_minutes === null ? m : Math.max(m ?? 0, r.longest_screen_wait_minutes)),
+        null,
+      );
       return {
         asOf: last.finished_at,
         stale: isOpdStale(last.finished_at),
@@ -188,7 +226,15 @@ async function buildBoard(): Promise<OpdBoard> {
           seenToday: sum("seen_today"),
           avgWaitMinutes: roundOrNull(mean(all)),
           medianWaitMinutes: roundOrNull(median(all)),
+          p90WaitMinutes: roundOrNull(percentile(all, 0.9)),
           longestWaitMinutes: rows.reduce((m, r) => Math.max(m, r.longest_wait_minutes), 0),
+          screenToDoctor: segment(
+            mergeSorted(rows.map((r) => r.screen_wait_minutes ?? [])),
+            sum("screen_excluded"),
+            sum("seen_today"),
+          ),
+          doctorToRx: segment(mergeSorted(rows.map((r) => r.rx_wait_minutes ?? [])), sum("rx_excluded"), sum("seen_with_rx")),
+          longestScreenWaitMinutes: longestScreen,
         },
       };
     },

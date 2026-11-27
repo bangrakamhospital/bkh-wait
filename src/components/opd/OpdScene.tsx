@@ -172,8 +172,8 @@ function layoutOpd(flow: OpdFlow | null, clinics: ClinicWait[]): Layout {
     code: c.clinicCode,
     name: shortName(c.clinicName),
     count: c.waitingForDoctor,
-    tone: waitTone(c.estimatedWaitMinutes ?? c.avgWaitMinutes ?? c.longestWaitMinutes),
-    est: c.estimatedWaitMinutes,
+    tone: waitTone(c.estimatedDoctorWaitMinutes ?? c.screenToDoctor.medianMinutes ?? c.longestScreenWaitMinutes ?? 0),
+    est: c.estimatedDoctorWaitMinutes,
     doctors: c.doctorsActive,
     active: isActive(c),
   }));

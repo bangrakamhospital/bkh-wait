@@ -15,7 +15,7 @@ const niceMax = (v: number) => {
   return Math.ceil(v / p) * p;
 };
 
-/** Hourly arrivals vs seen (bars) and average wait (line, right axis) for today. */
+/** Hourly arrivals vs seen (bars) and average screening -> doctor wait of those seen (line, right axis) for today. */
 export function OpdHourlyChart({ points }: { points: OpdHourPoint[] }) {
   const wrap = useRef<HTMLDivElement>(null);
   const [width, setWidth] = useState(720);
@@ -43,7 +43,7 @@ export function OpdHourlyChart({ points }: { points: OpdHourPoint[] }) {
   const hours = Array.from({ length: last - first + 1 }, (_, i) => first + i);
   const byHour = new Map(points.map((p) => [p.hour, p]));
   const maxCount = niceMax(Math.max(...points.map((p) => Math.max(p.arrived, p.seen))));
-  const maxWait = niceMax(Math.max(30, ...points.map((p) => p.avgWaitMinutes ?? 0)));
+  const maxWait = niceMax(Math.max(30, ...points.map((p) => p.avgScreenWaitMinutes ?? 0)));
   const iw = W - PAD.l - PAD.r;
   const ih = H - PAD.t - PAD.b;
   const slot = iw / hours.length;
@@ -54,7 +54,7 @@ export function OpdHourlyChart({ points }: { points: OpdHourPoint[] }) {
   const xC = (i: number) => PAD.l + slot * i + slot / 2;
 
   const linePts = hours
-    .map((h, i) => ({ i, v: byHour.get(h)?.avgWaitMinutes ?? null }))
+    .map((h, i) => ({ i, v: byHour.get(h)?.avgScreenWaitMinutes ?? null }))
     .filter((p): p is { i: number; v: number } => p.v !== null);
   const path = linePts.map((p, k) => `${k === 0 ? "M" : "L"}${xC(p.i)},${yW(p.v)}`).join(" ");
 
@@ -66,7 +66,7 @@ export function OpdHourlyChart({ points }: { points: OpdHourPoint[] }) {
           height={H}
           className="block h-56"
           role="img"
-          aria-label="กราฟแท่งผู้ป่วยมาถึงและได้พบแพทย์รายชั่วโมง พร้อมเส้นเวลารอเฉลี่ย"
+          aria-label="กราฟแท่งผู้ป่วยมาถึงและได้พบแพทย์รายชั่วโมง พร้อมเส้นเวลาซักประวัติถึงพบแพทย์เฉลี่ย"
         >
           {[0, 0.25, 0.5, 0.75, 1].map((f) => (
             <g key={f}>
@@ -100,7 +100,7 @@ export function OpdHourlyChart({ points }: { points: OpdHourPoint[] }) {
           {path ? <path d={path} fill="none" strokeWidth={2} className="stroke-amber-500" /> : null}
           {linePts.map((p) => (
             <circle key={p.i} cx={xC(p.i)} cy={yW(p.v)} r={3.5} className="fill-amber-500">
-              <title>{`${hours[p.i]}:00 รอเฉลี่ย ${Math.round(p.v)} นาที`}</title>
+              <title>{`${hours[p.i]}:00 ซักประวัติ → พบแพทย์ เฉลี่ย ${Math.round(p.v)} นาที`}</title>
             </circle>
           ))}
         </svg>
@@ -113,7 +113,7 @@ export function OpdHourlyChart({ points }: { points: OpdHourPoint[] }) {
           <span className="inline-block h-2.5 w-2.5 rounded-sm bg-emerald-500" /> ได้พบแพทย์ (คน)
         </span>
         <span className="inline-flex items-center gap-1">
-          <span className="inline-block h-0.5 w-4 bg-amber-500" /> รอเฉลี่ย (นาที, แกนขวา)
+          <span className="inline-block h-0.5 w-4 bg-amber-500" /> ซักประวัติ → พบแพทย์ เฉลี่ย (นาที, แกนขวา)
         </span>
       </div>
     </Card>

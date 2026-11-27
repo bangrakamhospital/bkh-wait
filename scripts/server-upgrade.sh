@@ -198,6 +198,10 @@ main() {
     echo "    no OPD worker in this version"
   elif crontab -l 2>/dev/null | grep -qF 'scripts/sync-opd.mjs'; then
     echo "    OPD already installed (cron line present)"
+    # db/009 wait segments for days finalized before it (only those columns change)
+    node --env-file="$APP_DIR/.env.sync" scripts/sync-opd.mjs --resegment=30 >> "$LOG_DIR/sync-opd.log" 2>&1 \
+      || { tail -n 1 "$LOG_DIR/sync-opd.log"; fail "8/10 OPD resegment"; }
+    tail -n 1 "$LOG_DIR/sync-opd.log" | sed 's/^/    /'
   else
     node --env-file="$APP_DIR/.env.sync" scripts/sync-opd.mjs --backfill=30 >> "$LOG_DIR/sync-opd.log" 2>&1 \
       || { tail -n 1 "$LOG_DIR/sync-opd.log"; fail "8/10 first OPD sync"; }

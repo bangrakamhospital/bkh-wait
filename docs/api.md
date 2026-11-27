@@ -459,6 +459,32 @@ mean 140 min, NCD `047` mean 236 min (patients register from 06:00 for
 fasting labs, doctors start about 09:00), PCU `030` mean 62 min — see the
 report of the feature branch for the per-day numbers.
 
+The registration-based fields above (`avg/median/p90WaitMinutes`,
+`longestWaitMinutes`, `estimatedWaitMinutes`, `hourly[].avgWaitMinutes`)
+are kept unchanged for API compatibility. The board UI uses the wait
+segments below.
+
+### Wait segments (db/009) — the way auditors measure waits
+
+| term | definition |
+| --- | --- |
+| screen time | the **latest** `ovst_service_time` `OPD-SCREEN` `service_begin_datetime` at or before the doctor exam start (not seen yet: the latest one). `opdscreen.begintime/endtime/outtime` are empty in every row and `update_datetime` is the last edit, so they are not used. Screening takes a median 3 min (begin → end); the end is often re-saved after the doctor. |
+| doctor exam end | `service_end_datetime` of the same first `OPD-DOCTOR` row (median 1–4 min after the start; missing → start) |
+| medicine handed over | the earliest `rx_dispenser_detail.rx_dispenser_datetime` with `rx_dispenser_type_id = 4` "ผู้จ่ายยา" (depcode `013`). Types 1 ผู้บันทึกรายการใบสั่งยา / 2 ผู้จัดยา / 3 ผู้ตรวจสอบยา are earlier pharmacy steps. The visit is mostly sent home in the same minute. `rx_operator.pay/call_time`, `ovst_rx_queue`, `rx_queue_dispense*`, `ovst_queue_server_*`, `opitemrece_pay` are empty in this HOSxP. |
+| `screenToDoctor` | doctor exam start − screen time, over `seenToday` visits that have a screen time |
+| `doctorToRx` | medicine handed over − doctor exam end, over seen visits with at least one drug item (`opitemrece` JOIN `drugitems`) that got their drugs. During the day only those who already got their drugs count. |
+| excluded | a value < 0 or > 480 min is left out of the statistics and counted in `excluded` (e.g. drugs handed over the next day) |
+| `WaitSegment` | `{ avgMinutes, medianMinutes, p90Minutes, n, excluded, base }`; `base` = `seenToday` (screen) or seen visits with a drug item (rx); fill rate = `(n + excluded) / base` |
+| `longestScreenWaitMinutes` | longest now − screen time among `waitingNow` visits that were screened (≤ 480 min); `null` when none |
+| `estimatedDoctorWaitMinutes` | `ceil(waitingForDoctor × 60 / seenLastHour)`, capped at 480: rough wait in front of the doctor room after screening; `null` when `seenLastHour = 0` |
+| `hourly[].avgScreenWaitMinutes` | mean `screenToDoctor` of those seen in that hour |
+
+Fill rates (2026-11-20 … 2026-11-26): screen time for 99–100 % of seen
+visits at `001` / `047`; none at PCU `032` / `034` and few at `030` (those
+units do not record `OPD-SCREEN`). Drug handover for 63–93 % of seen
+visits with a drug item. Hospital medians: screening → doctor 54–82 min
+(registration → doctor 94–158 min); doctor → medicine 62–111 min.
+
 ### Visit flow (`OpdBoard.flow`, `wait.opd_flow`, db/008)
 
 Starts from the TOTAL: `flow.total` = `COUNT(*) FROM ovst WHERE vstdate = date`
@@ -472,7 +498,7 @@ now (`ovst.cur_dep` + the board's waiting rules), so
 | 1 | `admit` | Admit | `ovst.an` set, or `cur_dep = '010'` (IPD) |
 | 2 | `er` | ห้องฉุกเฉิน (ER) | `main_dep = '011'` or `cur_dep = '011'` |
 | 3 | `done` | กลับบ้านแล้ว | `cur_dep = '999'` |
-| 4 | `pharmacy` | ห้องยา / การเงิน | `cur_dep` `013` pharmacy / `014` cashier. HOSxP here has no dispense timestamp (`rx_operator.pay`, `ovst_rx_queue` unused), so patients who already got their drugs stay here until sent home (≈ 30–50 visits at the end of a day). |
+| 4 | `pharmacy` | ห้องยา / การเงิน | `cur_dep` `013` pharmacy / `014` cashier. Patients who already got their drugs (`rx_dispenser_detail` type 4, see wait segments) stay here until sent home (≈ 30–50 visits at the end of a day); the bucket rule is unchanged. |
 | 5 | `screening` | รอซักประวัติ/คัดกรอง | the board's `waitingNow − waitingForDoctor` (not seen, ≤ 480 min, not screened, not at the clinic room) |
 | 5 | `doctor` | รอพบแพทย์ | the board's `waitingForDoctor` (also those at lab / X-ray before the doctor) |
 | 6 | `lab` | ห้อง Lab / X-ray | `cur_dep` `007` / `006` (mostly lab-only visits, `main_dep = '007'`) |
@@ -507,13 +533,18 @@ memoised 10 s per process. All minute values are whole minutes (rounded).
       "clinicCode": "001", "clinicName": "ห้องตรวจโรคทั่วไป",
       "waitingNow": 18, "waitingForDoctor": 9, "longestWaitMinutes": 175,
       "seenToday": 76, "avgWaitMinutes": 121, "medianWaitMinutes": 110, "p90WaitMinutes": 190,
-      "doctorsActive": 2, "seenLastHour": 14, "estimatedWaitMinutes": 78
+      "doctorsActive": 2, "seenLastHour": 14, "estimatedWaitMinutes": 78,
+      "screenToDoctor": { "avgMinutes": 46, "medianMinutes": 35, "p90Minutes": 85, "n": 74, "excluded": 0, "base": 76 },
+      "doctorToRx": { "avgMinutes": 60, "medianMinutes": 48, "p90Minutes": 114, "n": 33, "excluded": 0, "base": 62 },
+      "longestScreenWaitMinutes": 96, "estimatedDoctorWaitMinutes": 39
     }
   ],
-  "hourly": [ { "hour": 8, "arrived": 120, "seen": 0, "avgWaitMinutes": null } ],
+  "hourly": [ { "hour": 8, "arrived": 120, "seen": 0, "avgWaitMinutes": null, "avgScreenWaitMinutes": null } ],
   "totals": {
     "waitingNow": 60, "waitingForDoctor": 31, "seenToday": 290,
-    "avgWaitMinutes": 130, "medianWaitMinutes": 115, "longestWaitMinutes": 290
+    "avgWaitMinutes": 130, "medianWaitMinutes": 115, "p90WaitMinutes": 220, "longestWaitMinutes": 290,
+    "screenToDoctor": { "…": "WaitSegment" }, "doctorToRx": { "…": "WaitSegment" },
+    "longestScreenWaitMinutes": 150
   }
 }
 ```
@@ -557,7 +588,9 @@ At most 92 days (same validation as `/api/v1/census`).
   "generatedAt": "…", "lastSyncAt": "…", "stale": false,
   "days": [
     { "date": "2026-11-25", "finalized": true, "visits": 520, "seen": 470,
-      "avgWaitMinutes": 128, "medianWaitMinutes": 112, "p90WaitMinutes": 240, "within60Pct": 24.3 }
+      "avgWaitMinutes": 128, "medianWaitMinutes": 112, "p90WaitMinutes": 240, "within60Pct": 24.3,
+      "screenToDoctor": { "avgMinutes": 59.7, "medianMinutes": 70, "p90Minutes": 98, "n": 311, "excluded": 0, "base": 442 },
+      "doctorToRx": { "avgMinutes": 121.3, "medianMinutes": 111, "p90Minutes": 275, "n": 257, "excluded": 5, "base": 281 } }
   ],
   "rows": [ …OpdDaily ]
 }
@@ -570,4 +603,8 @@ doctor here, wait stats over `seen` (waits > 720 min left out),
 `days` = whole hospital per day, computed from all visits (median of all
 waits, not of the clinic medians). `finalized`: `false` = today (changes
 every 5 min) · `true` = recomputed for the whole day from HOSxP by the
-first OPD sync of a later day, never changes again.
+first OPD sync of a later day, never changes again (except the segment
+columns, which `scripts/sync-opd.mjs --resegment=N` recomputes for days
+finalized before db/009). `screenToDoctor` / `doctorToRx` (`WaitSegment`,
+1 decimal) are `null` for days finalized before db/009 and not
+recomputed.
