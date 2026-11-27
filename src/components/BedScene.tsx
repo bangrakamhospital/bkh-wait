@@ -1451,9 +1451,11 @@ export default function BedScene({
         setOccLoad("error");
         return;
       }
-      const list = (await r.json()) as BedOccupant[];
+      // API body: { wardCode, asOf, occupants: BedOccupant[] } (older builds: a bare array).
+      const body = (await r.json()) as { occupants?: BedOccupant[] } | BedOccupant[];
+      const list = Array.isArray(body) ? body : Array.isArray(body?.occupants) ? body.occupants : [];
       if (reqWard.current !== it.ward) return;
-      setOcc({ wards, ward: it.ward, at: Date.now(), list: Array.isArray(list) ? list : [] });
+      setOcc({ wards, ward: it.ward, at: Date.now(), list });
       setOccLoad("idle");
     } catch {
       if (reqWard.current === it.ward) setOccLoad("error");

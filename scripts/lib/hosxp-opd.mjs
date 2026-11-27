@@ -1,9 +1,29 @@
 // HOSxP (read-only) queries + aggregation for the OPD "waiting to see a
 // doctor" board, used ONLY by the OPD sync worker (scripts/sync-opd.mjs).
-// Connection / error handling: scripts/lib/hosxp.mjs. Nothing that
-// identifies a patient leaves the SQL: no VN / HN / names are selected
-// (VN is used only inside the queries as the join key), and the doctor
-// code is only counted (COUNT DISTINCT) in SQL.
+// Connection / error handling: scripts/lib/hosxp.mjs. Aggregates only, with
+// ONE exception (same pattern as the bed HN, db/006): the waiters of today
+// (header "Waiters"). fetchVisits keeps the VN in memory as the join key
+// for that lookup only; fetchWaiterDetails returns the HN + queue number of
+// the visits waiting now, which the worker writes ONLY to the restricted
+// table wait.opd_waiter (db/010, readable solely through the audited
+// function wait.opd_waiters_for_clinic). VN / HN are never logged, printed
+// or written anywhere else; no names / CID / address / phone are selected.
+// The doctor code is only counted (COUNT DISTINCT) in SQL.
+//
+// Waiters (listWaiters, verified on HOSxP 2026-11-27): exactly the visits
+// the board counts in waitingNow per clinic (same router + waitState), plus
+// stale ones (registered > STALE_WAIT_MINUTES ago, otherwise the same
+// conditions; flagged stale, NOT in the board counts): mostly visits left
+// at a screening point without being closed. Per visit:
+//   stage         'doctor' = counted in waitingForDoctor, else 'screening'
+//   queue no.     ovst.oqueue (unique per day, filled for every visit)
+//   labPending    a lab_head of the visit with confirm_report <> 'Y' and
+//                 not rejected (lab_perform_status_id 3)
+//   xrayOrdered   an xray_report of the visit not cancelled (status 4);
+//                 HOSxP here keeps every request at status 2 "รออ่านฟิล์ม"
+//                 with no examined / report time, so "done" is unknown
+//   minutes       since registration / since screening, at the sync time
+//                 (HOSxP clock), as the board's longest waits
 //
 // Definitions (verified with db-cli on HOSxP, 2026-10-29 .. 2026-11-26):
 // - Visit: ovst row of the day (vstdate). Registration = vstdate + vsttime
@@ -237,12 +257,12 @@ export async function fetchRoutes(his, today) {
 /**
  * One row per visit of `date` — ALL ovst rows of the day, ER included
  * (er = true; the per-clinic board skips them) — coded fields only:
- * { regMs, mainDep, curDep, er, admitted, screened, docDep, docMs,
+ * { vn (in-memory join key, never output), regMs, mainDep, curDep, er, admitted, screened, docDep, docMs,
  *   docEndMs, scrMs, rxMs, hasRx } (wait segments: see header).
  */
 export async function fetchVisits(his, date) {
   const rows = await his.query(
-    `SELECT TIMESTAMP(o.vstdate, o.vsttime) AS reg_at, o.main_dep, o.cur_dep,
+    `SELECT o.vn, TIMESTAMP(o.vstdate, o.vsttime) AS reg_at, o.main_dep, o.cur_dep,
             (o.an IS NOT NULL AND o.an <> '') AS admitted,
             EXISTS (SELECT 1 FROM ovst_service_time s
                      WHERE s.vn = o.vn AND s.ovst_service_time_type_code = 'OPD-SCREEN') AS screened,
@@ -260,6 +280,8 @@ export async function fetchVisits(his, date) {
     { d: date, lo: vnPrefix(date), hi: vnPrefix(addDays(date, 1)), nonDoctor: NON_DOCTOR_CSV, rxType: RX_DISPENSE_TYPE },
   );
   return rows.map((r) => ({
+    // join key for fetchWaiterDetails only: never log, print or store it
+    vn: code(r.vn),
     regMs: r.reg_at ? hisMs(r.reg_at) : null,
     mainDep: code(r.main_dep),
     curDep: code(r.cur_dep),
@@ -497,6 +519,80 @@ export function classifyFlow(visits, clinicSet, route, nowMs) {
   const sum = Object.values(counts).reduce((a, b) => a + b, 0);
   if (sum !== total) throw new Error(`flow buckets sum ${sum} != total ${total}`);
   return { total, counts, byDep };
+}
+
+/**
+ * Visits waiting now per clinic (header "Waiters"), live only. Non-stale
+ * rows are exactly the board's waitingNow (stage 'doctor' = its
+ * waitingForDoctor); stale rows are the same conditions past
+ * STALE_WAIT_MINUTES. -> [{ vn, clinic, stage, stale, regMs, scrMs, curDep,
+ * minutesSinceRegistration, minutesSinceScreening }] (vn: join key only).
+ */
+export function listWaiters(visits, clinicSet, route, nowMs) {
+  const r = router(clinicSet, route);
+  const out = [];
+  for (const v of visits) {
+    if (v.er || v.regMs === null || isSeen(v, clinicSet)) continue;
+    const clinic = r.liveClinic(v);
+    if (!clinic) continue;
+    let w = waitState(v, clinic, nowMs);
+    let stale = false;
+    if (!w) {
+      // stale: everything of waitState except the age limit
+      const age = Math.round((nowMs - v.regMs) / 60_000);
+      if (v.admitted || DONE_DEPS.has(v.curDep) || age <= STALE_WAIT_MINUTES) continue;
+      w = { age, forDoctor: v.screened || v.curDep === clinic };
+      stale = true;
+    }
+    out.push({
+      vn: v.vn,
+      clinic,
+      stage: w.forDoctor ? "doctor" : "screening",
+      stale,
+      regMs: v.regMs,
+      scrMs: v.scrMs,
+      curDep: v.curDep || null,
+      minutesSinceRegistration: w.age,
+      minutesSinceScreening: v.scrMs === null ? null : Math.max(0, Math.round((nowMs - v.scrMs) / 60_000)),
+    });
+  }
+  return out;
+}
+
+/**
+ * RESTRICTED: HN, queue number and lab / X-ray state of the given visits
+ * (header "Waiters"). Only for wait.opd_waiter; never log or print the
+ * result. -> Map vn -> { hn, oqueue, labPending, xrayOrdered }
+ */
+export async function fetchWaiterDetails(his, vns) {
+  const out = new Map();
+  for (let i = 0; i < vns.length; i += 500) {
+    const chunk = vns.slice(i, i + 500);
+    // execute() has no array expansion: one named placeholder per VN
+    const params = Object.fromEntries(chunk.map((vn, j) => [`v${j}`, vn]));
+    const rows = await his.query(
+      `SELECT o.vn, o.hn, o.oqueue,
+              EXISTS (SELECT 1 FROM lab_head h
+                       WHERE h.vn = o.vn AND coalesce(h.confirm_report, 'N') <> 'Y'
+                         AND coalesce(h.lab_perform_status_id, 0) <> 3) AS lab_pending,
+              EXISTS (SELECT 1 FROM xray_report x
+                       WHERE x.vn = o.vn AND coalesce(x.xray_status_id, 0) <> 4) AS xray_ordered
+         FROM ovst o
+        WHERE o.vn IN (${chunk.map((_, j) => `:v${j}`).join(", ")})`,
+      params,
+    );
+    for (const r of rows) {
+      const hn = code(r.hn);
+      if (!hn) continue;
+      out.set(code(r.vn), {
+        hn,
+        oqueue: r.oqueue === null || r.oqueue === undefined ? null : num(r.oqueue),
+        labPending: num(r.lab_pending) === 1,
+        xrayOrdered: num(r.xray_ordered) === 1,
+      });
+    }
+  }
+  return out;
 }
 
 /** Rough wait for a patient arriving now (see header). */

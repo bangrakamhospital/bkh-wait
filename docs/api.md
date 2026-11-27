@@ -4,8 +4,9 @@ All endpoints live under `/api`, return JSON and use the types in
 `src/lib/beds/types.ts`. Only aggregate counts, ward configuration,
 refer-back metadata and the public bed layout (bed numbers + occupied flag)
 cross the API — never patient names, CID or AN. The ONE exception is the
-HN per bed of `GET /api/beds/occupants`: logged-in `staff` only, every
-view written to the audit log (see "Bed occupants").
+HN per bed of `GET /api/beds/occupants` and the HN of a clinic's OPD
+waiters of `GET /api/opd/waiters`: logged-in `staff` only, every view
+written to the audit log (see "Bed occupants" and "OPD waiters").
 
 ## Conventions
 
@@ -434,7 +435,9 @@ Types: `src/lib/opd/types.ts` (`OpdBoard`, `ClinicWait`, `OpdHourPoint`,
 `OpdDaily`). Source: PostgreSQL only (`wait.opd_*`), written by the OPD
 sync worker `scripts/sync-opd.mjs` (cron every 5 min, 06:00–20:55
 Asia/Bangkok). The web app never queries HOSxP. Aggregates only — no HN,
-VN, names, queue numbers or doctor codes are stored or sent.
+VN, names, queue numbers or doctor codes are stored or sent — except the
+restricted waiter list (`wait.opd_waiter`, below "OPD waiters"), which
+only logged-in staff can read, audited, through its own endpoint.
 
 ### Definitions (HOSxP, `scripts/lib/hosxp-opd.mjs`)
 
@@ -566,6 +569,70 @@ memoised 10 s per process. All minute values are whole minutes (rounded).
   (not a median of medians).
 - 503 `SYNC_NOT_READY` before the first successful OPD sync,
   503 `WAIT_DB_NOT_CONFIGURED` without PostgreSQL.
+
+### OPD waiters (staff only, HN): `GET /api/opd/waiters?clinic=001`
+
+Who is waiting in one clinic right now — for the /opd clinic table: a
+staff member clicks a clinic's "ยังไม่พบแพทย์ / รอซักประวัติ / รอพบแพทย์"
+count or "รอนานสุดขณะนี้" and finds the people who waited too long.
+Types: `src/lib/opd/waiter-types.ts` (`ClinicWaiters`, `OpdWaiter`).
+
+200
+```json
+{
+  "clinicCode": "001",
+  "clinicName": "ห้องตรวจโรคทั่วไป",
+  "asOf": "2026-11-27T06:55:04.120Z",
+  "waiters": [
+    { "hn": "<HN>", "queueNo": 112, "stage": "doctor", "stale": false,
+      "registeredAt": "2026-11-27T01:35:00.000Z", "screenedAt": "2026-11-27T01:50:00.000Z",
+      "minutesSinceRegistration": 380, "minutesSinceScreening": 305,
+      "curDep": "061", "curDepName": "จุดซักประวัติตรวจโรคทั่วไป",
+      "labPending": true, "xrayOrdered": false }
+  ]
+}
+```
+- Rows with `stale: false` are exactly the visits the board counts for the
+  clinic: their number = `waitingNow`, those with `stage: "doctor"` =
+  `waitingForDoctor`, the largest `minutesSinceScreening` =
+  `longestScreenWaitMinutes` (same worker run, same rules: `listWaiters`
+  in `scripts/lib/hosxp-opd.mjs`, checked by the worker's `--dry-run`).
+- `stale: true`: registered more than 8 h ago, not seen, not sent home /
+  to pharmacy / admitted — not in the board counts; mostly visits left at a
+  screening point without being closed.
+- `queueNo` = HOSxP `ovst.oqueue`. `labPending` = a lab order without a
+  confirmed report (not rejected). `xrayOrdered` = an X-ray request (not
+  cancelled); HOSxP here does not record when the film was taken.
+- Minutes are as of `asOf` (the OPD sync, every 5 min). Order: non-stale
+  first, longest wait (since screening, else since registration) first.
+- Only rows of today (Asia/Bangkok) are returned.
+
+| status | when |
+| ------ | ---- |
+| 401 `UNAUTHENTICATED` | no / expired session |
+| 403 `FORBIDDEN` | role `partner`, or a cross-site request |
+| 400 `VALIDATION` | `clinic` missing or not 1–3 letters/digits |
+| 404 `NOT_FOUND` | clinic not on the board (unknown or hidden) — no audit row |
+| 429 `RATE_LIMITED` | more than 30 calls per minute for this user; `Retry-After` |
+| 503 | `SYNC_NOT_READY` / `WAIT_DB_NOT_CONFIGURED` |
+
+Privacy rules (same as "Bed occupants"):
+- Stored in `wait.opd_waiter` (db/010), written only by the OPD worker
+  (role `bkh_wait_sync`: INSERT / DELETE, no SELECT), replaced every run.
+  HN, queue number, times, stage, current department, lab / X-ray flags —
+  no VN, names, CID, address or phone.
+- The web app role cannot read the table; it calls
+  `wait.opd_waiters_for_clinic(clinic, actor)` (`SECURITY DEFINER`), which
+  returns the rows and appends one `wait.audit_log` row (`action` =
+  `opd_waiter.view`, `entity` = `opd_clinic`, `entity_id` = clinic,
+  `detail.rows`) in the same statement. Review:
+  `SELECT at, actor, entity_id, detail FROM wait.audit_log WHERE action = 'opd_waiter.view' ORDER BY at DESC;`
+- `Cache-Control: private, no-store`, `Vary: Cookie`; never memoised. The
+  UI fetches it each time the panel opens and keeps it in component state
+  only (no URL, storage, labels or tooltips). Never in `/api/opd/board`
+  or `/api/v1/*`.
+- The worker's `--dry-run` prints waiter COUNTS per clinic next to the
+  board numbers (`waiters.allMatch`), never an HN or VN.
 
 ### Central API: `GET /api/v1/opd/current`
 

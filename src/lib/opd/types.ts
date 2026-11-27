@@ -1,7 +1,8 @@
 // Shared contract for the OPD "waiting to see a doctor" board, between the
 // data layer (scripts/lib/hosxp-opd.mjs + src/lib/opd/*, owned by sr) and the
 // UI (src/components/opd/*, src/app/opd/*, owned by jr). Aggregate numbers
-// only — never HN, VN, names, queue numbers tied to a person.
+// only — never HN, VN, names, queue numbers tied to a person. The restricted
+// staff-only waiter list (HN) has its own contract: ./waiter-types.ts.
 
 /**
  * One measured wait segment (db/009, scripts/lib/hosxp-opd.mjs "Wait
