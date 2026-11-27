@@ -3,7 +3,8 @@ import "server-only";
 import { isWaitDbConfigured, WaitDbConfigError, withPgTransaction } from "@/lib/db/pg";
 import { ApiError } from "@/lib/http";
 
-import type { ClinicWait, OpdBoard, OpdHourPoint } from "./types";
+import { FLOW_DEFS } from "./flow";
+import type { ClinicWait, OpdBoard, OpdFlow, OpdHourPoint } from "./types";
 
 /**
  * OPD "waiting to see a doctor" board, read ONLY from PostgreSQL: the last
@@ -123,6 +124,26 @@ async function buildBoard(): Promise<OpdBoard> {
         [last.his_today],
       );
 
+      // Visit flow: hospital-wide, ALL visits (hidden clinics included — it is
+      // the total of the day, not a clinic view). One sync writes all buckets
+      // of a day together, so their sum is the day's ovst count.
+      const flowRows = await tx.query<{ bucket: string; visits: number; finished_at: string }>(
+        `SELECT f.bucket, f.visits, r.finished_at
+           FROM opd_flow f JOIN sync_run r ON r.id = f.sync_run_id
+          WHERE f.visit_date = $1::date`,
+        [last.his_today],
+      );
+      let flow: OpdFlow | null = null;
+      if (flowRows.length > 0) {
+        const byKey = new Map(flowRows.map((f) => [f.bucket, f.visits]));
+        const buckets = FLOW_DEFS.map((d) => ({ key: d.key, label: d.label, count: byKey.get(d.key) ?? 0 }));
+        flow = {
+          total: buckets.reduce((n, b) => n + b.count, 0),
+          buckets,
+          asOf: flowRows[0].finished_at,
+        };
+      }
+
       const clinics: ClinicWait[] = rows.map((r) => {
         const waits = r.wait_minutes ?? [];
         return {
@@ -158,6 +179,7 @@ async function buildBoard(): Promise<OpdBoard> {
         asOf: last.finished_at,
         stale: isOpdStale(last.finished_at),
         date: last.his_today,
+        flow,
         clinics,
         hourly,
         totals: {

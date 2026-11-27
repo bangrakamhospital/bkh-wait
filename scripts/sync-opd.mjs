@@ -23,14 +23,18 @@
 //   3. PostgreSQL, ONE transaction (advisory lock): his_opd_clinic,
 //      opd_route (when refreshed), sync_run (job 'opd'), opd_state
 //      (replaced), opd_hourly + opd_daily of today (replaced / upserted),
-//      earlier open days recomputed and finalized
+//      opd_flow of today (replaced: where every visit of the day is now,
+//      the buckets sum to COUNT(*) FROM ovst), earlier open days
+//      recomputed and finalized
 //   4. on failure: rollback, a sync_run row (job 'opd', ok = false, short
 //      error code only), exit code 1
 // Re-running is safe: every write is an upsert / replace.
 //
 // --dry-run: steps 1-2 without PostgreSQL (routes always read from HOSxP);
-//   prints what would be written. --date=YYYY-MM-DD: report that day as a
-//   closed day instead of today (verification).
+//   prints what would be written, plus an independent COUNT(*) of ovst to
+//   cross-check the flow total. --date=YYYY-MM-DD: report that day as a
+//   closed day instead of today (verification; its flow = where that day's
+//   visits are now, by HOSxP's current cur_dep).
 // --backfill=N (1-92): also write finalized rows for the N days before
 //   today that have no opd_daily rows yet (first install).
 
@@ -38,11 +42,14 @@ import { errCode, fetchClock, openHis, SyncError } from "./lib/hosxp.mjs";
 import {
   addDays,
   aggregateDay,
+  classifyFlow,
   estimateWait,
   fetchDepartmentNames,
   fetchDoctorsActive,
   fetchRoutes,
+  fetchVisitCount,
   fetchVisits,
+  FLOW_BUCKETS,
   hisMs,
   waitStats,
 } from "./lib/hosxp-opd.mjs";
@@ -75,7 +82,7 @@ const ts = () => new Date().toISOString();
 /** Clinic set = clinics of the last 28 days + any clinic with a doctor exam in `visits`. */
 function clinicSetOf(clinics28, ...visitLists) {
   const set = new Set(clinics28.keys());
-  for (const list of visitLists) for (const v of list) if (v.docDep) set.add(v.docDep);
+  for (const list of visitLists) for (const v of list) if (v.docDep && !v.er) set.add(v.docDep);
   return set;
 }
 
@@ -103,11 +110,12 @@ async function readHis(his, { routesStored, openDays, backfillDays }) {
   const routes = routesStored ?? (await fetchRoutes(his, today));
   const visits = await fetchVisits(his, today);
   const doctors = dateArg ? new Map() : await fetchDoctorsActive(his, today);
+  const countCheck = dryRun ? await fetchVisitCount(his, today) : null;
   const closing = [];
   for (const day of new Set([...openDays, ...backfillDays])) {
     if (day < clock.today) closing.push({ day, visits: await fetchVisits(his, day) });
   }
-  return { clock, today, names, routes, routesFresh: routesStored === null, visits, doctors, closing };
+  return { clock, today, names, routes, routesFresh: routesStored === null, visits, doctors, closing, countCheck };
 }
 
 function summarize(h) {
@@ -125,7 +133,9 @@ function summarize(h) {
     day: c.day,
     rows: dayRows(aggregateDay(c.visits, clinicSet, route, null), h.names),
   }));
-  return { nowMs, clinicSet, today, closing };
+  // The flow is always "now": cur_dep is HOSxP's current state (also for --date).
+  const flow = classifyFlow(h.visits, clinicSet, route, hisMs(h.clock.now));
+  return { nowMs, clinicSet, today, closing, flow };
 }
 
 function emptyAgg() {
@@ -169,6 +179,15 @@ function dryRunReport(h, s) {
       waitingNow: sum("waitingNow"),
       waitingForDoctor: sum("waitingForDoctor"),
       ...waitStats(all),
+    },
+    flow: {
+      total: s.flow.total,
+      ovstCount: h.countCheck,
+      sum: Object.values(s.flow.counts).reduce((a, b) => a + b, 0),
+      buckets: s.flow.counts,
+      bucketsByCurDep: s.flow.byDep,
+      boardWaitingNow: sum("waitingNow"),
+      boardWaitingForDoctor: sum("waitingForDoctor"),
     },
     hourly: Array.from({ length: 24 }, (_, hour) => {
       let arrived = 0, seen = 0, ws = 0, wn = 0;
@@ -330,6 +349,13 @@ async function writePg(client, h, s, startedAt) {
     ],
   );
 
+  await client.query("DELETE FROM opd_flow WHERE visit_date = $1", [h.today]);
+  await client.query(
+    `INSERT INTO opd_flow (visit_date, bucket, visits, sync_run_id, updated_at)
+     SELECT $1::date, x.b, x.n, $2::bigint, now() FROM unnest($3::text[], $4::int[]) AS x(b, n)`,
+    [h.today, run.id, FLOW_BUCKETS, FLOW_BUCKETS.map((b) => s.flow.counts[b])],
+  );
+
   for (const c of s.closing) await writeDay(client, c.day, c.rows, true);
   await writeDay(client, h.today, s.today, false);
 
@@ -376,7 +402,7 @@ async function main() {
     const waiting = s.today.reduce((n, r) => n + r.e.waitingNow, 0);
     const seen = s.today.reduce((n, r) => n + r.seen, 0);
     console.log(
-      `${ts()} opd sync ok: run ${runId}, ${h.today}, ${s.clinicSet.size} clinic(s), waiting ${waiting}, seen ${seen}` +
+      `${ts()} opd sync ok: run ${runId}, ${h.today}, ${s.clinicSet.size} clinic(s), waiting ${waiting}, seen ${seen}, visits ${s.flow.total}` +
         (h.routesFresh ? ", routes refreshed" : "") +
         (h.closing.length ? `, finalized ${h.closing.map((c) => c.day).join(" ")}` : "") +
         `, ${Date.now() - startedAt.getTime()} ms`,
