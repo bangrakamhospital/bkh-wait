@@ -8,21 +8,25 @@ export function DepartmentTable({
   rows,
   total,
   filtered = false,
+  title = "สรุปเตียงรายแผนก",
+  nameHeader = "แผนก",
 }: {
   rows: DepartmentRow[];
   total: BedSummary;
   /** A department filter is active: the total row covers only `rows`. */
   filtered?: boolean;
+  title?: string;
+  nameHeader?: string;
 }) {
   const showNoBed = total.noBed > 0;
   const cell = "py-2 pr-3 text-right tabular-nums";
   return (
-    <Card title="สรุปเตียงรายแผนก">
+    <Card title={title}>
       <div className="overflow-x-auto">
         <table className="w-full text-xs">
           <thead className="border-b border-brand-100 text-slate-600">
             <tr>
-              <th className="py-2 pr-3 text-left">แผนก</th>
+              <th className="py-2 pr-3 text-left">{nameHeader}</th>
               <th className={cell}>เตียงทั้งหมด</th>
               <th className={cell}>เตียงคนนอน</th>
               <th className={cell}>เตียงว่าง</th>

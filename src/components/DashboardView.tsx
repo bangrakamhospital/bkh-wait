@@ -36,6 +36,8 @@ export function DashboardView({ board }: { board: BedBoard }) {
   const summed = summarize(shownWards);
   const totals = dept ? summed : { ...summed, referWaiting: board.totals.referWaiting };
   const shownRows = dept ? rows.filter((r) => r.code === filter) : rows;
+  // Summary table: one row per HOSxP ward (ward.name), not per department group.
+  const wardRows: DepartmentRow[] = shownWards.map((w) => ({ code: w.wardCode, name: w.wardName, summary: summarize([w]) }));
 
   return (
     <>
@@ -58,7 +60,13 @@ export function DashboardView({ board }: { board: BedBoard }) {
         <StatTile label="รอส่งกลับ" value={fmtNum(totals.referWaiting)} unit="ราย" tone="brand" />
       </div>
 
-      <DepartmentTable rows={shownRows} total={totals} filtered={dept !== null} />
+      <DepartmentTable
+        rows={wardRows}
+        total={totals}
+        filtered={dept !== null}
+        title="สรุปเตียงรายหอผู้ป่วย (ward)"
+        nameHeader="หอผู้ป่วย"
+      />
 
       <Card title="ผังเตียงแบบ 3 มิติ">
         <BedSceneLoader wards={realWards} departments={board.departments} focusDept={filter} />
