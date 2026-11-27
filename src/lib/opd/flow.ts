@@ -46,3 +46,21 @@ export const FLOW_DEFS: readonly { key: OpdFlowKey; label: string; definition: s
     definition: "ไม่เข้ากลุ่มใดข้างต้น เช่น ยังไม่พบแพทย์แต่ลงทะเบียนเกิน 8 ชม. หรือไม่ระบุจุด",
   },
 ];
+
+/**
+ * One fixed colour per bucket, shared by the flow tiles (Tailwind class) and
+ * the 3D / 2D waiting-point scene (hex, same Tailwind palette value), so a
+ * bucket looks the same everywhere.
+ */
+export const FLOW_COLOR: Record<OpdFlowKey, { bg: string; hex: string }> = {
+  screening: { bg: "bg-amber-400", hex: "#fbbf24" },
+  doctor: { bg: "bg-orange-500", hex: "#f97316" },
+  after_doctor: { bg: "bg-brand-500", hex: "#1f9a8f" },
+  lab: { bg: "bg-sky-500", hex: "#0ea5e9" },
+  services: { bg: "bg-violet-500", hex: "#8b5cf6" },
+  pharmacy: { bg: "bg-teal-600", hex: "#0d9488" },
+  done: { bg: "bg-emerald-500", hex: "#10b981" },
+  er: { bg: "bg-red-500", hex: "#ef4444" },
+  admit: { bg: "bg-rose-400", hex: "#fb7185" },
+  other: { bg: "bg-slate-400", hex: "#94a3b8" },
+};

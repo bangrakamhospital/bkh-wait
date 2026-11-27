@@ -1,7 +1,7 @@
 "use client";
 
 import dynamic from "next/dynamic";
-import type { ClinicWait } from "@/lib/opd/types";
+import type { ClinicWait, OpdFlow } from "@/lib/opd/types";
 import { LoadingState } from "../ui";
 
 const OpdScene = dynamic(() => import("./OpdScene"), {
@@ -13,6 +13,6 @@ const OpdScene = dynamic(() => import("./OpdScene"), {
   ),
 });
 
-export function OpdSceneLoader({ clinics }: { clinics: ClinicWait[] }) {
-  return <OpdScene clinics={clinics} />;
+export function OpdSceneLoader({ flow, clinics }: { flow: OpdFlow | null; clinics: ClinicWait[] }) {
+  return <OpdScene flow={flow} clinics={clinics} />;
 }
