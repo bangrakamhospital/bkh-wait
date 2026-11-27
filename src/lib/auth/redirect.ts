@@ -3,7 +3,7 @@
  * protocol-relative "//", backslashes or control characters; never /login,
  * /api/* or /auth/*). Falls back to `fallback`. Pure, client + server.
  */
-export function safeNextPath(raw: string | null | undefined, fallback = "/refer"): string {
+export function safeNextPath(raw: string | null | undefined, fallback = "/opd"): string {
   if (!raw || raw.length > 2048) return fallback;
   if (!raw.startsWith("/") || raw.startsWith("//") || /[\\\u0000-\u001f\u007f]/.test(raw)) {
     return fallback;
