@@ -128,10 +128,11 @@ main() {
 
   echo "==> 10/10 check"
   BODY=""
-  for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do
+  # The app needs a while after pm2 restart; nginx answers 502 until then.
+  for _ in $(seq 1 30); do
     BODY="$(curl -sk --max-time 5 https://127.0.0.1:84/api/board 2>/dev/null)"
-    [ -n "$BODY" ] && break
-    sleep 2
+    printf "%s" "$BODY" | grep -q "\"bedSlots\"" && break
+    sleep 3
   done
   if printf '%s' "$BODY" | grep -q '"bedSlots"'; then
     echo "    /api/board ok (bedSlots present)"
