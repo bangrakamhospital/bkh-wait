@@ -1,7 +1,7 @@
 "use client";
 
 import { createContext, useCallback, useContext, useEffect, useId, useRef, useState, type ReactNode } from "react";
-import { AlertTriangle, FlaskConical, ScanLine, ShieldCheck, X } from "lucide-react";
+import { AlertTriangle, ChevronRight, FlaskConical, ScanLine, ShieldCheck, Users, X } from "lucide-react";
 
 import type { ClinicWaiters, OpdWaiter } from "@/lib/opd/waiter-types";
 import { fmtDateTime, fmtNum, waitTone } from "../format";
@@ -80,9 +80,12 @@ export function WaitersTrigger({
       aria-label={label}
       aria-haspopup="dialog"
       onClick={(e) => open({ clinicCode, clinicName, filter }, e.currentTarget)}
-      className="rounded-sm text-brand-700 underline decoration-dotted underline-offset-2 hover:bg-brand-50 focus:outline-none focus-visible:ring-2 focus-visible:ring-brand-500"
+      title="กดเพื่อดูรายชื่อ"
+      className="group inline-flex cursor-pointer items-center gap-1 rounded-md border border-brand-200 bg-white px-1.5 py-0.5 text-brand-800 shadow-sm transition-colors hover:border-brand-500 hover:bg-brand-50 focus:outline-none focus-visible:ring-2 focus-visible:ring-brand-500"
     >
+      <Users aria-hidden className="h-3.5 w-3.5 shrink-0 text-brand-600" />
       {children}
+      <ChevronRight aria-hidden className="h-3.5 w-3.5 shrink-0 text-slate-400 transition-transform group-hover:translate-x-0.5 group-hover:text-brand-600" />
     </button>
   );
 }
