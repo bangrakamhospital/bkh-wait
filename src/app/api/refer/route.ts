@@ -3,6 +3,7 @@ import type { NextRequest } from "next/server";
 import { createReferBack, invalidateBoardCache, listReferBack } from "@/lib/beds/board";
 import { REFER_STATUSES } from "@/lib/beds/refer";
 import type { ReferStatus } from "@/lib/beds/types";
+import { ANY_ROLE } from "@/lib/auth/roles";
 import { errorResponse, intParam, json, readJsonBody, requireSession, validation } from "@/lib/http";
 
 export async function GET(request: NextRequest) {
@@ -33,7 +34,7 @@ export async function GET(request: NextRequest) {
 
 export async function POST(request: Request) {
   try {
-    const session = await requireSession(["staff", "partner"]);
+    const session = await requireSession(ANY_ROLE);
     const body = await readJsonBody(request);
     const created = await createReferBack(
       {

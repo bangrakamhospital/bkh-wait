@@ -20,8 +20,10 @@ view written to the audit log (see "Bed occupants").
   | 404  | `NOT_FOUND`               | refer request id / ward does not exist                           |
   | 409  | `INVALID_TRANSITION`      | status change not allowed from the current status                |
   | 415  | `UNSUPPORTED_MEDIA_TYPE`  | write request without `Content-Type: application/json`           |
-  | 429  | `TOO_MANY_ATTEMPTS`       | too many failed logins; `Retry-After` header (seconds)           |
-  | 503  | `AUTH_NOT_CONFIGURED`     | `WAIT_SESSION_SECRET` not set on the server — login disabled     |
+  | 429  | `TOO_MANY_ATTEMPTS`       | reserved (sign-in limits now come back as `/login?code=rate_limited_N`) |
+  | 503  | `AUTH_NOT_CONFIGURED`     | `AUTH_SECRET` / `WAIT_SESSION_SECRET` (or the access-code key) not set — login disabled |
+  | 503  | `AUTH_STORE_UNAVAILABLE`  | user store (PostgreSQL) unreadable — access refused (fail closed) |
+  | 409  | `CONFLICT`                | admin change not allowed (own account, env admin, last admin, too many codes) |
   | 503  | `WAIT_DB_NOT_CONFIGURED`  | PostgreSQL (`WAIT_DATABASE_URL`) not set — refer/config features off |
   | 429  | `RATE_LIMITED`            | central API: too many calls for this key / failed keys from this IP; bed occupants: too many calls for this user; `Retry-After` |
   | 503  | `SYNC_NOT_READY`          | no successful HOSxP sync yet (board has no data)                 |
@@ -37,27 +39,51 @@ view written to the audit log (see "Bed occupants").
 
 ## Auth
 
-Accounts are configured on the server (env `WAIT_USERS`). Roles:
+Sign-in uses Auth.js (next-auth v5), the same design as bkh-kpi (:82):
 
-| role      | who                                   | can                                                      |
-| --------- | ------------------------------------- | -------------------------------------------------------- |
-| `staff`   | Bangrakam ward / refer staff          | everything: list, create, any status change, departments |
-| `partner` | regional hospital refer centre        | list, create; cancel only requests it created            |
+| method | how | session role |
+| --- | --- | --- |
+| Provider ID (PLK Health ID / MOPH Provider ID, OIDC) | button on `/login`; org allow-list `AUTH_PLKHEALTH_ALLOWED_ORGS` (empty = denied); new accounts wait for approval at `/admin/users` | `staff` or `admin` (from `wait.app_user`; `AUTH_ADMIN_SUBS` = always admin) |
+| access code (outsiders) | "รหัสสำหรับบุคคลภายนอก" on `/login`; per-person code issued at `/admin/access-codes` (default 7 days, max 90) | `partner`, always |
+| backup account (`WAIT_USERS`) | collapsed "บัญชีสำรอง" on `/login` | as configured: `admin` / `staff` / `partner` |
 
-### `POST /api/login`
-Body `{ "username": string, "password": string }`
-- 200 `{ "user": { "username": string, "role": "staff" | "partner" } }` and sets
-  the httpOnly cookie `bkh_wait_session` (12 h)
-- 401 `UNAUTHENTICATED` (same message for unknown user and wrong password)
-- 429 `TOO_MANY_ATTEMPTS` (failed logins per 5 min: 5 per IP+username,
-  20 per IP, 10 per username from any IP), 503 `AUTH_NOT_CONFIGURED`
+| role      | can                                                                 |
+| --------- | ------------------------------------------------------------------- |
+| `admin`   | everything `staff` can + `/admin/*`, `/api/admin/*`                 |
+| `staff`   | refer list, create, any status change, departments, bed HN (audited) |
+| `partner` | boards; list / create own requests, cancel only its own; **never HN** (`/api/beds/occupants` -> 403) |
 
-### `POST /api/logout`
-No body. 200 `{ "ok": true }`, clears the cookie. Always succeeds.
+- Session: encrypted cookie `__Secure-bkh-wait.session-token` (no prefix when
+  cookies are insecure), absolute lifetime 8 h. Role and validity are
+  re-read from env + PostgreSQL on **every** request: rejecting a user,
+  changing a role, revoking a code or removing a `WAIT_USERS` entry applies
+  on the next request.
+- Endpoints `/api/auth/*` are Auth.js (`csrf`, `providers`, `signin/*`,
+  `callback/*`, `signout`, `session`); browsers use `next-auth/react`
+  `signIn` / `signOut` (CSRF token flow). `/auth/callback` is the redirect
+  URI registered at the IdP and forwards to `/api/auth/callback/plkhealth`.
+- Failed sign-ins redirect to `/login?error=<type>&code=<code>` (codes in
+  `src/lib/auth/messages.ts`); 5 failed passwords per IP+user / 5 min and 5
+  failed access codes per IP / 5 min, then `code=rate_limited_<minutes>`.
+- Logins, logouts and admin actions are written to `wait.audit_log`
+  (`auth.*`, `user.update`, `access_code.create|revoke`).
+- `503 AUTH_STORE_UNAVAILABLE`: the user store (PostgreSQL) could not be
+  read, so access is refused (fail closed).
 
 ### `GET /api/session`
-200 `{ "user": { "username": string, "role": "staff" | "partner" } | null }`
-— use it to decide whether to show login / refer forms.
+200 `{ "user": { "username": string, "name": string, "role": "admin" | "staff" | "partner", "provider": "sso" | "code" | "local", "expiresAt"?: string } | null }`
+— `username` is the principal id (`sso:<sub>`, `code:<id>` or the
+`WAIT_USERS` name); `expiresAt` only for access codes.
+
+### Admin (role `admin`; writes same-origin + `application/json`)
+- `GET /api/admin/users` -> `{ users: AdminUser[], me: { sub } }`
+- `PATCH /api/admin/users/{sub}` `{ status?: "pending"|"approved"|"rejected", role?: "admin"|"staff" }`
+  -> `{ user }`; 409 `CONFLICT` for own account, `AUTH_ADMIN_SUBS` accounts
+  and removing the last approved admin
+- `GET /api/admin/access-codes` -> `{ codes }` (never hashes / plaintext)
+- `POST /api/admin/access-codes` `{ name, org, expiresOn: "YYYY-MM-DD" }`
+  -> 201 `{ code, plaintext }` — the only time the code is shown
+- `DELETE /api/admin/access-codes/{id}` -> `{ code }` (revoked; row kept)
 
 ## Board (public)
 

@@ -161,14 +161,14 @@ export async function createReferBack(input: CreateReferInput, session: Session)
   return withPgTransaction(async (tx) => {
     const [row] = await tx.query<ReferRow>(
       `INSERT INTO refer_back_request (case_ref, from_hospital, ward_code, diagnosis_note, created_by, updated_by)
-       VALUES ($1, $2, $3, $4, $5, $5)
+       VALUES ($1, $2, $3, $4, $5, $6)
        RETURNING ${SELECT_COLUMNS}`,
-      [caseRef, fromHospital, wardCode, diagnosisNote, session.username],
+      [caseRef, fromHospital, wardCode, diagnosisNote, session.username, session.actor],
     );
     await tx.query(
       `INSERT INTO audit_log (actor, action, entity, entity_id, detail)
        VALUES ($1, 'refer.create', 'refer_back_request', $2, $3::jsonb)`,
-      [session.username, String(row.id), JSON.stringify({ wardCode, fromHospital })],
+      [session.actor, String(row.id), JSON.stringify({ wardCode, fromHospital })],
     );
     return toApi(row, session.username);
   });
@@ -223,12 +223,12 @@ export async function updateReferStatus(
               updated_at = now()
         WHERE id = $1
         RETURNING ${SELECT_COLUMNS}`,
-      [id, to, ward, session.username],
+      [id, to, ward, session.actor],
     );
     await tx.query(
       `INSERT INTO audit_log (actor, action, entity, entity_id, detail)
        VALUES ($1, 'refer.status', 'refer_back_request', $2, $3::jsonb)`,
-      [session.username, String(id), JSON.stringify({ from: cur.status, to, wardCode: ward })],
+      [session.actor, String(id), JSON.stringify({ from: cur.status, to, wardCode: ward })],
     );
     return toApi(row, session.username);
   });

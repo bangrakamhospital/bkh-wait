@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 // Make one WAIT_USERS entry (username:role:scrypt-hash).
 //
-//   node scripts/hash-password.mjs <username> <staff|partner>
+//   node scripts/hash-password.mjs <username> <admin|staff|partner>
 //
 // The password is read from stdin (typed with echo off on a TTY, or piped),
 // never from the command line, so it does not end up in shell history / ps.
@@ -11,8 +11,8 @@
 import { randomBytes, scrypt } from "node:crypto";
 
 const [username, role] = process.argv.slice(2);
-if (!username || !/^[a-z0-9_.-]{2,32}$/.test(username.toLowerCase()) || !["staff", "partner"].includes(role)) {
-  console.error("usage: node scripts/hash-password.mjs <username [a-z0-9_.-]{2,32}> <staff|partner>");
+if (!username || !/^[a-z0-9_.-]{2,32}$/.test(username.toLowerCase()) || !["admin", "staff", "partner"].includes(role)) {
+  console.error("usage: node scripts/hash-password.mjs <username [a-z0-9_.-]{2,32}> <admin|staff|partner>");
   process.exit(2);
 }
 

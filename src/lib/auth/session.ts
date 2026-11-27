@@ -1,126 +1,80 @@
 import "server-only";
 
-import { createHmac, timingSafeEqual } from "node:crypto";
-import { cookies } from "next/headers";
-
-import { findUser, type Role } from "./users";
+import { auth } from "@/auth";
+import { resolveAccess } from "./access";
+import { isSessionProvider, type Role, type SessionInfo, type SessionProvider } from "./roles";
+import { isAuthConfigured } from "./settings";
 
 /**
- * Stateless session: httpOnly cookie `bkh_wait_session` =
- *   base64url(JSON {u, r, f, iat, exp}) "." base64url(HMAC-SHA256)
- * signed with WAIT_SESSION_SECRET (>= 32 chars; unset -> login disabled).
+ * Current session for route handlers and server components.
  *
- * A session is valid only while the account still exists in WAIT_USERS
- * with the same role and password-hash fingerprint, so removing a user or
- * changing their password revokes their sessions on the next request.
- * Rotating WAIT_SESSION_SECRET logs everybody out.
+ * The Auth.js cookie (src/auth.ts) only proves WHO signed in and when; the
+ * role and whether the session is still valid are re-read from env +
+ * PostgreSQL here on every call (src/lib/auth/access.ts). So rejecting a
+ * user, demoting an admin, revoking an access code or removing a WAIT_USERS
+ * entry takes effect on the next request.
  *
- * Cookie flags: HttpOnly, SameSite=Lax, Path=/, Max-Age 12 h; Secure in
- * production unless WAIT_COOKIE_INSECURE=true (plain-HTTP intranet).
+ *   null                       not signed in / expired / no longer allowed
+ *   throws SessionStoreUnavailable  user store unreadable (fail closed: 503)
  */
 
-export const SESSION_COOKIE = "bkh_wait_session";
-export const SESSION_MAX_AGE_SECONDS = 12 * 60 * 60;
-const MIN_SECRET_LENGTH = 32;
-
 export interface Session {
+  /** Stable principal id: "sso:<sub>", "code:<id>" or the WAIT_USERS name. */
   username: string;
+  name: string;
   role: Role;
+  provider: SessionProvider;
+  /** Identifies the person in audit_log and bed_occupants_for_ward (<= 64 chars). */
+  actor: string;
+  /** Provider ID sub (sso sessions only). */
+  sub: string | null;
+  /** Access-code expiry (code sessions only). */
+  expiresAt?: string;
 }
 
-interface Payload {
-  u: string;
-  r: Role;
-  f: string;
-  iat: number;
-  exp: number;
+export class SessionStoreUnavailable extends Error {
+  override name = "SessionStoreUnavailable";
 }
 
-function secret(): string | null {
-  const s = process.env.WAIT_SESSION_SECRET ?? "";
-  return s.length >= MIN_SECRET_LENGTH ? s : null;
-}
+export { isAuthConfigured };
 
-export function isAuthConfigured(): boolean {
-  return secret() !== null;
-}
-
-export function secureCookies(): boolean {
-  if (process.env.WAIT_COOKIE_INSECURE?.trim().toLowerCase() === "true") return false;
-  return process.env.NODE_ENV === "production";
-}
-
-function sign(data: string, key: string): string {
-  return createHmac("sha256", key).update(data).digest("base64url");
-}
-
-export function createSessionToken(
-  user: { username: string; role: Role; fingerprint: string },
-  now = Date.now(),
-): string {
-  const key = secret();
-  if (!key) throw new Error("WAIT_SESSION_SECRET is not configured");
-  const iat = Math.floor(now / 1000);
-  const payload: Payload = {
-    u: user.username,
-    r: user.role,
-    f: user.fingerprint,
-    iat,
-    exp: iat + SESSION_MAX_AGE_SECONDS,
-  };
-  const body = Buffer.from(JSON.stringify(payload)).toString("base64url");
-  return `${body}.${sign(body, key)}`;
-}
-
-export function verifySessionToken(
-  token: string | undefined,
-  now = Date.now(),
-): Session | null {
-  const key = secret();
-  if (!key || !token || token.length > 1024) return null;
-  const dot = token.indexOf(".");
-  if (dot <= 0) return null;
-  const body = token.slice(0, dot);
-  const sig = Buffer.from(token.slice(dot + 1));
-  const expected = Buffer.from(sign(body, key));
-  if (sig.length !== expected.length || !timingSafeEqual(sig, expected)) return null;
-  let p: Payload;
+export async function getSession(): Promise<Session | null> {
+  if (!isAuthConfigured()) return null;
+  let raw: unknown;
   try {
-    p = JSON.parse(Buffer.from(body, "base64url").toString("utf8")) as Payload;
+    raw = (await auth())?.user;
   } catch {
+    // Undecryptable / malformed cookie: treat as signed out.
     return null;
   }
-  if (typeof p.exp !== "number" || p.exp * 1000 <= now) return null;
-  const user = typeof p.u === "string" ? findUser(p.u) : null;
-  if (!user || user.role !== p.r || user.fingerprint !== p.f) return null;
-  return { username: user.username, role: user.role };
-}
-
-/** Current session from the request cookie (route handlers / server components). */
-export async function getSession(): Promise<Session | null> {
-  const store = await cookies();
-  return verifySessionToken(store.get(SESSION_COOKIE)?.value);
-}
-
-/** Sets the session cookie (route handlers / server functions only). */
-export async function setSessionCookie(token: string): Promise<void> {
-  const store = await cookies();
-  store.set(SESSION_COOKIE, token, {
-    httpOnly: true,
-    sameSite: "lax",
-    secure: secureCookies(),
-    path: "/",
-    maxAge: SESSION_MAX_AGE_SECONDS,
+  const u = raw as { username?: unknown; name?: unknown; provider?: unknown; fp?: unknown } | undefined;
+  if (!u || typeof u.username !== "string" || !u.username || !isSessionProvider(u.provider)) return null;
+  const access = await resolveAccess(u.username, u.provider, {
+    fingerprint: typeof u.fp === "string" ? u.fp : undefined,
+    name: typeof u.name === "string" ? u.name : undefined,
   });
+  if (!access.ok) {
+    if (access.reason === "store_error") throw new SessionStoreUnavailable("user store unavailable");
+    return null;
+  }
+  return {
+    username: u.username,
+    name: access.name,
+    role: access.role,
+    provider: u.provider,
+    actor: access.actor,
+    sub: access.sub,
+    ...(access.expiresAt ? { expiresAt: access.expiresAt } : {}),
+  };
 }
 
-export async function clearSessionCookie(): Promise<void> {
-  const store = await cookies();
-  store.set(SESSION_COOKIE, "", {
-    httpOnly: true,
-    sameSite: "lax",
-    secure: secureCookies(),
-    path: "/",
-    maxAge: 0,
-  });
+/** Client-safe view (GET /api/session). */
+export function sessionInfo(s: Session): SessionInfo {
+  return {
+    username: s.username,
+    name: s.name,
+    role: s.role,
+    provider: s.provider,
+    ...(s.expiresAt ? { expiresAt: s.expiresAt } : {}),
+  };
 }

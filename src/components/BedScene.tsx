@@ -1293,7 +1293,8 @@ async function loadRole(): Promise<Auth> {
     if (!r.ok) return "guest";
     const j = (await r.json()) as { user?: { role?: string } | null };
     if (!j.user) return "guest";
-    return j.user.role === "staff" ? "staff" : "forbidden";
+    // admin and staff may see HN; partner (outsiders) never.
+    return j.user.role === "staff" || j.user.role === "admin" ? "staff" : "forbidden";
   } catch {
     return "guest";
   }
