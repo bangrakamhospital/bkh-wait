@@ -35,6 +35,33 @@ export type OpdHourPoint = {
   avgWaitMinutes: number | null;
 };
 
+/** Visit-flow bucket keys (db/008 CHECK list, scripts/lib/hosxp-opd.mjs FLOW_BUCKETS). */
+export type OpdFlowKey =
+  | "screening"
+  | "doctor"
+  | "after_doctor"
+  | "lab"
+  | "services"
+  | "pharmacy"
+  | "done"
+  | "er"
+  | "admit"
+  | "other";
+
+export type OpdFlowBucket = { key: OpdFlowKey; label: string; count: number };
+
+/**
+ * Where every visit of today is now. total = COUNT(*) FROM ovst of the day
+ * (ER included, same as bkh-kpi "visit ผู้ป่วยนอก"); each visit is in
+ * exactly one bucket, so sum(buckets.count) === total always.
+ */
+export type OpdFlow = {
+  total: number;
+  buckets: OpdFlowBucket[];
+  /** ISO time of the sync that computed it. */
+  asOf: string;
+};
+
 export type OpdBoard = {
   /** ISO time of the last successful OPD sync. */
   asOf: string;
@@ -42,6 +69,8 @@ export type OpdBoard = {
   stale: boolean;
   /** YYYY-MM-DD (Asia/Bangkok). */
   date: string;
+  /** Hospital-wide visit flow of `date`; null until a sync with db/008 ran today. */
+  flow: OpdFlow | null;
   clinics: ClinicWait[];
   hourly: OpdHourPoint[];
   totals: {

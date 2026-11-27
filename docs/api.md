@@ -440,7 +440,7 @@ VN, names, queue numbers or doctor codes are stored or sent.
 
 | term | definition |
 | --- | --- |
-| visit | `ovst` row of the day (`vstdate`), registration time = `vstdate + vsttime`. Visits registered at the ER (`main_dep = '011'`) are left out entirely (ER has its own triage, not an OPD queue). Cancelled visits are deleted from `ovst` by HOSxP, so they never appear. |
+| visit | `ovst` row of the day (`vstdate`), registration time = `vstdate + vsttime`. Visits registered at the ER (`main_dep = '011'`) are left out of the per-clinic board (ER has its own triage, not an OPD queue); they are counted in the visit flow below. Cancelled visits are deleted from `ovst` by HOSxP, so they never appear. |
 | doctor exam start | the earliest `ovst_service_time.service_begin_datetime` with `ovst_service_time_type_code = 'OPD-DOCTOR'` of the visit, at a **clinic** (below). `OPD-NEW-VISIT` = registration (≈ `vsttime`), `OPD-SCREEN` = screening / vital signs (ซักประวัติ), `OPD-DOCTOR` = the doctor-room screen was opened. |
 | clinic (`clinicCode`) | a `kskdepartment.depcode` where doctor exams happen: any depcode with `OPD-DOCTOR` rows in the last 28 days, **minus** non-doctor points: `010` IPD, `011` ER, `027` physiotherapy, `020`/`061`/`062` screening points, `006` X-ray, `007` lab, `013` pharmacy, `014` cashier, `023` medical records, `060` insurance, `999` home. Name = `kskdepartment.department` without the leading `NNN-`. Staff can rename / hide / order clinics in `wait.opd_clinic_config` (SQL for now). |
 | clinic of a seen visit | the depcode of its doctor exam start |
@@ -459,6 +459,35 @@ mean 140 min, NCD `047` mean 236 min (patients register from 06:00 for
 fasting labs, doctors start about 09:00), PCU `030` mean 62 min — see the
 report of the feature branch for the per-day numbers.
 
+### Visit flow (`OpdBoard.flow`, `wait.opd_flow`, db/008)
+
+Starts from the TOTAL: `flow.total` = `COUNT(*) FROM ovst WHERE vstdate = date`
+(every visit of the day, ER included; the same number as bkh-kpi
+"visit ผู้ป่วยนอก"). Each visit is put in exactly ONE bucket by where it is
+now (`ovst.cur_dep` + the board's waiting rules), so
+`sum(flow.buckets[].count) === flow.total` always. First match wins:
+
+| order | key | label | rule |
+| --- | --- | --- | --- |
+| 1 | `admit` | Admit | `ovst.an` set, or `cur_dep = '010'` (IPD) |
+| 2 | `er` | ห้องฉุกเฉิน (ER) | `main_dep = '011'` or `cur_dep = '011'` |
+| 3 | `done` | กลับบ้านแล้ว | `cur_dep = '999'` |
+| 4 | `pharmacy` | ห้องยา / การเงิน | `cur_dep` `013` pharmacy / `014` cashier. HOSxP here has no dispense timestamp (`rx_operator.pay`, `ovst_rx_queue` unused), so patients who already got their drugs stay here until sent home (≈ 30–50 visits at the end of a day). |
+| 5 | `screening` | รอซักประวัติ/คัดกรอง | the board's `waitingNow − waitingForDoctor` (not seen, ≤ 480 min, not screened, not at the clinic room) |
+| 5 | `doctor` | รอพบแพทย์ | the board's `waitingForDoctor` (also those at lab / X-ray before the doctor) |
+| 6 | `lab` | ห้อง Lab / X-ray | `cur_dep` `007` / `006` (mostly lab-only visits, `main_dep = '007'`) |
+| 7 | `services` | ทันตกรรม / ตา / กายภาพ / คลินิกอื่น | `cur_dep` not an OPD point (dental, eye `018`, physio, Thai medicine, clinics without a doctor queue) |
+| 8 | `after_doctor` | พบแพทย์แล้ว รอขั้นตอนต่อ | doctor exam recorded, `cur_dep` still at an OPD point |
+| 9 | `other` | อื่นๆ / ค้างในระบบ | the rest: not seen at an OPD point but stale (> 480 min) or unrouted; empty `cur_dep` |
+
+OPD point = a queue clinic (route target), a route source department
+(screening points `061`/`062`/`020`, PCU `030`/`032` …) or registration
+`023`/`060`. `buckets` come in display order (`src/lib/opd/flow.ts`).
+Today's rows are replaced every OPD sync; earlier days keep their last
+snapshot. Verified 2026-11-24 … 2026-11-27: sum = `COUNT(*)` every day;
+`screening + doctor` = board `waitingNow`. `flow` is `null` until the
+first sync with db/008 ran for `date`.
+
 ### `GET /api/opd/board` (public)
 
 200 `OpdBoard`. `Cache-Control: public, max-age=30, stale-while-revalidate=60`;
@@ -469,6 +498,10 @@ memoised 10 s per process. All minute values are whole minutes (rounded).
   "asOf": "2026-11-26T04:20:05.000Z",
   "stale": false,
   "date": "2026-11-26",
+  "flow": {
+    "total": 605, "asOf": "2026-11-26T04:20:05.000Z",
+    "buckets": [ { "key": "screening", "label": "รอซักประวัติ/คัดกรอง", "count": 11 }, "… 10 buckets" ]
+  },
   "clinics": [
     {
       "clinicCode": "001", "clinicName": "ห้องตรวจโรคทั่วไป",
@@ -509,6 +542,7 @@ Same auth / rate limit / audit as the other `/api/v1` endpoints.
 
 ```json
 { "hospcode": "11252", "asOf": "…", "stale": false, "date": "2026-11-26",
+  "flow": { …OpdBoard.flow },
   "totals": { …OpdBoard.totals },
   "clinics": [ …ClinicWait ] }
 ```

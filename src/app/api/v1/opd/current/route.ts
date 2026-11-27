@@ -10,6 +10,7 @@ export async function GET(request: Request) {
       asOf: board.asOf,
       stale: board.stale,
       date: board.date,
+      flow: board.flow,
       totals: board.totals,
       clinics: board.clinics,
     };

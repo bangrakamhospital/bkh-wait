@@ -24,10 +24,10 @@ export function OpdClinicTable({ clinics, totals }: { clinics: ClinicWait[]; tot
             <thead className="border-b border-brand-100 text-slate-600">
               <tr>
                 <th className="py-2 pr-3 text-left">แผนก / คลินิก</th>
-                <th className={cell}>รอตอนนี้ (คน)</th>
-                <th className={cell}>รอคัดกรอง</th>
-                <th className={cell}>คัดกรองแล้ว รอหน้าห้องตรวจ</th>
-                <th className={cell}>ตรวจแล้ว</th>
+                <th className={cell}>ยังไม่พบแพทย์ (คน)</th>
+                <th className={cell}>รอซักประวัติ/คัดกรอง</th>
+                <th className={cell}>รอพบแพทย์</th>
+                <th className={cell}>พบแพทย์แล้ว</th>
                 <th className={cell}>รอเฉลี่ย</th>
                 <th className={cell}>มัธยฐาน</th>
                 <th className={cell}>P90</th>
@@ -61,7 +61,7 @@ export function OpdClinicTable({ clinics, totals }: { clinics: ClinicWait[]; tot
                 </tr>
               ))}
               <tr className="font-semibold">
-                <td className="py-2 pr-3">รวมทั้งโรงพยาบาล</td>
+                <td className="py-2 pr-3">รวมทุกคลินิก</td>
                 <td className={cell}>{fmtNum(totals.waitingNow)}</td>
                 <td className={cell}>{fmtNum(waitingScreen(totals))}</td>
                 <td className={cell}>{fmtNum(totals.waitingForDoctor)}</td>
@@ -80,6 +80,10 @@ export function OpdClinicTable({ clinics, totals }: { clinics: ClinicWait[]; tot
             </tbody>
           </table>
           <p className="mt-2 text-xs text-slate-500">
+            ยังไม่พบแพทย์ = รอซักประวัติ/คัดกรอง + รอพบแพทย์ (ตรงกับ 2 กลุ่มแรกของ visit วันนี้ด้านบน)
+            นับเฉพาะคลินิกที่มีแพทย์ตรวจ ไม่รวม ER, Lab อย่างเดียว, ทันตกรรม, คลินิกตา
+          </p>
+          <p className="mt-1 text-xs text-slate-500">
             สีเวลารอ: <span className="text-emerald-700">น้อยกว่า 30 นาที</span> ·{" "}
             <span className="text-amber-700">30-60 นาที</span> · <span className="text-orange-700">60-120 นาที</span> ·{" "}
             <span className="text-red-700">มากกว่า 120 นาที</span>
